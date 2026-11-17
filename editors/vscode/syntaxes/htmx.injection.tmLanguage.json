@@ -1,0 +1,53 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "htmx attributes",
+  "scopeName": "htmx.injection",
+  "comment": "htmx attribute names inside HTML start tags, matched ahead of HTML's own attribute rules. The value of hx-on is JavaScript.",
+  "injectionSelector": "L:meta.tag -meta.attribute -comment -meta.embedded.expression.askama -meta.embedded.statement.askama",
+  "patterns": [
+    { "include": "#hx-on" },
+    { "include": "#hx-attribute" }
+  ],
+  "repository": {
+    "hx-on": {
+      "begin": "(?:^|(?<=\\s))((?:data-)?hx-on(?:[\\-:][\\w:.\\-]*)?)(?![\\w:.\\-])",
+      "beginCaptures": { "1": { "name": "entity.other.attribute-name.html entity.name.type.htmx" } },
+      "end": "(?=\\s*+[^=\\s])",
+      "name": "meta.attribute.htmx.html",
+      "patterns": [
+        {
+          "begin": "=",
+          "beginCaptures": { "0": { "name": "punctuation.separator.key-value.html" } },
+          "end": "(?<=[^\\s=])(?!\\s*=)|(?=/?>)",
+          "patterns": [
+            {
+              "begin": "\"",
+              "end": "\"",
+              "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.html" } },
+              "endCaptures": { "0": { "name": "punctuation.definition.string.end.html" } },
+              "name": "string.quoted.double.html",
+              "contentName": "meta.embedded.inline.js source.js",
+              "patterns": [{ "include": "source.js" }]
+            },
+            {
+              "begin": "'",
+              "end": "'",
+              "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.html" } },
+              "endCaptures": { "0": { "name": "punctuation.definition.string.end.html" } },
+              "name": "string.quoted.single.html",
+              "contentName": "meta.embedded.inline.js source.js",
+              "patterns": [{ "include": "source.js" }]
+            }
+          ]
+        }
+      ]
+    },
+    "hx-attribute": {
+      "begin": "(?:^|(?<=\\s))((?:data-)?hx-[\\w:.\\-]+)(?![\\w:.\\-])",
+      "beginCaptures": { "1": { "name": "entity.other.attribute-name.html entity.name.type.htmx" } },
+      "end": "(?=\\s*+[^=\\s])",
+      "name": "meta.attribute.htmx.html",
+      "patterns": [{ "include": "text.html.basic#attribute-interior" }]
+    }
+  }
+}

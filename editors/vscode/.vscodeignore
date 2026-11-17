@@ -1,0 +1,10 @@
+# The VSIX holds the bundled client (out/extension.js, which contains the rest of out/), the
+# server (server/), the grammars, the snippets and the manifest. Everything else stays out.
+src/**
+test/**
+node_modules/**
+out/**
+!out/extension.js
+**/*.map
+tsconfig.json
+.vscode/**

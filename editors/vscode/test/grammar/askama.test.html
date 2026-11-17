@@ -1,0 +1,94 @@
+<!-- SYNTAX TEST "text.html.derivative" "Askama and htmx injections"
+      {{ order.customer.name|upper }}
+<!--  ^^ punctuation.section.embedded.begin.askama
+<!--     ^^^^^ variable.other.askama
+<!--           ^^^^^^^^ variable.other.property.askama
+<!--                         ^^^^^ support.function.filter.askama
+<!--                               ^^ punctuation.section.embedded.end.askama
+      {% for item in order.items %}
+<!--     ^^^ keyword.control.askama
+<!--         ^^^^ variable.other.askama
+<!--              ^^ keyword.control.askama
+      {% block content %}{% endblock %}
+<!--     ^^^^^ keyword.control.askama
+<!--           ^^^^^^^ entity.name.type.block.askama
+<!--                        ^^^^^^^^ keyword.control.askama
+      {% macro money_cell(cents) %}
+<!--           ^^^^^^^^^^ entity.name.function.macro.askama
+      {% call m::money_cell(item.total_cents()) %}{% endcall %}
+<!--          ^ entity.name.namespace.askama
+<!--             ^^^^^^^^^^ entity.name.function.askama
+<!--                             ^^^^^^^^^^^ entity.name.function.member.askama
+<!--                                                 ^^^^^^^ keyword.control.askama
+      {% extends "base.html" %}
+<!--     ^^^^^^^ keyword.control.askama
+<!--             ^^^^^^^^^^^ string.quoted.double.askama
+      {# a {# nested #} comment #} <p>
+<!--  ^^ punctuation.definition.comment.begin.askama
+<!--                    ^^^^^^^ comment.block.askama
+<!--                                ^ entity.name.tag.html
+      <a href="mailto:{{ email }}">
+<!--                     ^^^^^ string.quoted.double.html
+<!--                     ^^^^^ variable.other.askama
+      {% raw %}{{ not_parsed }}{% endraw %}
+<!--     ^^^ keyword.control.askama
+<!--              ^^^^^^^^^^ meta.raw.askama
+<!--              ^^^^^^^^^^ - variable.other.askama
+<!--                              ^^^^^^ keyword.control.askama
+      <button hx-get="/x/{{ id }}" hx-target="#content" data-hx-swap="outerHTML">
+<!--          ^^^^^^ entity.name.type.htmx
+<!--                        ^^ variable.other.askama
+<!--                               ^^^^^^^^^ entity.name.type.htmx
+<!--                                                    ^^^^^^^^^^^^ entity.name.type.htmx
+<!--                                         ^^^^^^^^^^ string.quoted.double.html
+      <div hx-on:click="go(1)" class="x">
+<!--       ^^^^^^^^^^^ entity.name.type.htmx
+<!--                    ^^ meta.embedded.inline.js
+<!--                           ^^^^^ - entity.name.type.htmx
+      hx-get is only text outside a tag
+<!--  ^^^^^^ - entity.name.type.htmx
+      {{ a || b }}
+<!--       ^^ keyword.operator.askama
+<!--          ^ - support.function.filter.askama
+      {{ "}}" }}
+<!--     ^^^^ string.quoted.double.askama
+      {%- if x -%}
+<!--  ^^^ punctuation.section.embedded.begin.askama
+<!--           ^^^ punctuation.section.embedded.end.askama
+      {{ 1.5 + 2u32 }}
+<!--     ^^^ constant.numeric.askama
+<!--         ^ keyword.operator.askama
+<!--           ^^^^ constant.numeric.askama
+      {% if loop.first && !done %}
+<!--        ^^^^ variable.language.askama
+<!--             ^^^^^ variable.other.property.askama
+<!--                   ^^ keyword.operator.askama
+      <!-- {{ x }} -->
+<!--          ^ variable.other.askama
+      <p class="{{ cls }}">text</p>
+<!--               ^^^ variable.other.askama
+<!--                       ^^^^ - meta.embedded.expression.askama
+      <option {% if sel %}selected{% endif %}>
+<!--             ^^ keyword.control.askama
+<!--                                 ^^^^^ keyword.control.askama
+      {% filter upper %}x{% endfilter %}
+<!--            ^^^^^ support.function.filter.askama
+      {{
+<!--  ^^ punctuation.section.embedded.begin.askama
+        order.id
+<!--    ^^^^^ variable.other.askama
+<!--          ^^ variable.other.property.askama
+      }}
+<!--  ^^ punctuation.section.embedded.end.askama
+      {{ "a" ~ name ~ "b" }}
+<!--         ^ keyword.operator.askama
+<!--           ^^^^ variable.other.askama
+      {%- decl x -%}{% declare y %}
+<!--      ^^^^ keyword.control.askama
+<!--                   ^^^^^^^ keyword.control.askama
+      {{ Self::NAME }} {{ crate::X }}
+<!--     ^^^^ variable.language.askama
+<!--                      ^^^^^ variable.language.askama
+      {{~ name ~}}
+<!--  ^^^ punctuation.section.embedded.begin.askama
+<!--           ^^^ punctuation.section.embedded.end.askama

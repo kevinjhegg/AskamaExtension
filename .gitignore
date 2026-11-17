@@ -1,0 +1,6 @@
+/target/
+/fixtures/sample-site/target/
+/editors/vscode/node_modules/
+/editors/vscode/out/
+/editors/vscode/server/
+*.vsix

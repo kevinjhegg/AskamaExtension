@@ -1,0 +1,127 @@
+{
+  "for": {
+    "prefix": [
+      "for",
+      "%for"
+    ],
+    "description": "Askama for loop",
+    "body": [
+      "{% for ${1:item} in ${2:items} %}",
+      "\t$0",
+      "{% endfor %}"
+    ]
+  },
+  "if": {
+    "prefix": [
+      "if",
+      "%if"
+    ],
+    "description": "Askama if",
+    "body": [
+      "{% if ${1:condition} %}",
+      "\t$0",
+      "{% endif %}"
+    ]
+  },
+  "if else": {
+    "prefix": [
+      "ifelse",
+      "%ifelse"
+    ],
+    "description": "Askama if with else",
+    "body": [
+      "{% if ${1:condition} %}",
+      "\t$2",
+      "{% else %}",
+      "\t$0",
+      "{% endif %}"
+    ]
+  },
+  "block": {
+    "prefix": [
+      "block",
+      "%block"
+    ],
+    "description": "Askama block",
+    "body": [
+      "{% block ${1:name} %}",
+      "\t$0",
+      "{% endblock %}"
+    ]
+  },
+  "macro": {
+    "prefix": [
+      "macro",
+      "%macro"
+    ],
+    "description": "Askama macro definition",
+    "body": [
+      "{% macro ${1:name}(${2:args}) %}",
+      "\t$0",
+      "{% endmacro %}"
+    ]
+  },
+  "call": {
+    "prefix": [
+      "call",
+      "%call"
+    ],
+    "description": "Askama macro call",
+    "body": [
+      "{% call ${1:name}(${2:args}) %}{% endcall %}$0"
+    ]
+  },
+  "match": {
+    "prefix": [
+      "match",
+      "%match"
+    ],
+    "description": "Askama match",
+    "body": [
+      "{% match ${1:value} %}",
+      "\t{% when ${2:pattern} %}",
+      "\t\t$0",
+      "{% endmatch %}"
+    ]
+  },
+  "let": {
+    "prefix": [
+      "let",
+      "%let"
+    ],
+    "description": "Askama let",
+    "body": [
+      "{% let ${1:name} = ${2:value} %}$0"
+    ]
+  },
+  "extends": {
+    "prefix": [
+      "extends",
+      "%extends"
+    ],
+    "description": "Askama extends",
+    "body": [
+      "{% extends \"${1:base.html}\" %}$0"
+    ]
+  },
+  "include": {
+    "prefix": [
+      "include",
+      "%include"
+    ],
+    "description": "Askama include",
+    "body": [
+      "{% include \"${1:partial.html}\" %}$0"
+    ]
+  },
+  "comment": {
+    "prefix": [
+      "comment",
+      "%comment"
+    ],
+    "description": "Askama comment",
+    "body": [
+      "{# $0 #}"
+    ]
+  }
+}

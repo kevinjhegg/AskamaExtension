@@ -1,0 +1,130 @@
+{
+  "name": "askama-vscode",
+  "displayName": "Askama IntelliSense",
+  "description": "Highlighting, navigation and completion for Askama templates in Rust projects.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.146.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/askama.toml",
+    "workspaceContains:**/templates/**/*.html"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Askama",
+      "properties": {
+        "askama.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the askama-lsp executable. Leave empty to use the one built in this repository (development) or bundled with the extension."
+        },
+        "askama.templateGlobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/templates/**"
+          ],
+          "description": "Glob patterns for the files the language server treats as Askama templates."
+        },
+        "askama.typeCompletion": {
+          "type": "boolean",
+          "default": true,
+          "description": "Complete the members of a template's values (such as `order.customer.`) by asking a private rust-analyzer about their types. It starts on first use and loads the crate, which takes memory and time. Restart the language server after changing this."
+        },
+        "askama.rustAnalyzer.path": {
+          "type": "string",
+          "default": "",
+          "description": "The rust-analyzer executable for type completion. Leave empty to use the one the rust-analyzer extension ships, or else `rust-analyzer` on the PATH. Restart the language server after changing this."
+        },
+        "askama.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the messages between VS Code and askama-lsp in the Askama Language Server output channel."
+        }
+      }
+    },
+    "grammars": [
+      {
+        "scopeName": "askama.injection",
+        "path": "./syntaxes/askama.injection.tmLanguage.json",
+        "injectTo": [
+          "text.html.basic",
+          "text.html.derivative"
+        ]
+      },
+      {
+        "scopeName": "htmx.injection",
+        "path": "./syntaxes/htmx.injection.tmLanguage.json",
+        "injectTo": [
+          "text.html.basic",
+          "text.html.derivative"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.inline.js": "javascript"
+        }
+      }
+    ],
+    "snippets": [
+      {
+        "language": "html",
+        "path": "./snippets/askama.code-snippets"
+      }
+    ],
+    "commands": [
+      {
+        "command": "askama.restartServer",
+        "title": "Askama: Restart Language Server"
+      },
+      {
+        "command": "askama.toggleComment",
+        "title": "Askama: Toggle Comment"
+      },
+      {
+        "command": "askama.surroundWithTag",
+        "title": "Askama: Surround with Tag"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "askama.toggleComment",
+        "key": "ctrl+/",
+        "mac": "cmd+/",
+        "when": "editorTextFocus && !editorReadonly && editorLangId == html && resourcePath =~ /[\\\\/]templates[\\\\/]/"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "vscode-tmgrammar-test -c -g test/grammar/vendor/html.tmLanguage.json -g test/grammar/vendor/html-derivative.tmLanguage.json -g test/grammar/vendor/source.js.stub.json -g test/grammar/vendor/source.css.stub.json \"test/grammar/*.test.html\" && node --test out/editing.test.js",
+    "package": "sh ../../scripts/package.sh",
+    "bundle": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
+    "vscode:prepublish": "npm run bundle"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.146.0",
+    "@vscode/vsce": "^4.1.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vscode-tmgrammar-test": "^0.1.3"
+  }
+}

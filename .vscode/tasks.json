@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build server",
+      "type": "shell",
+      "command": "cargo build -p askama-lsp",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build client",
+      "type": "shell",
+      "command": "npm run compile",
+      "options": { "cwd": "${workspaceFolder}/editors/vscode" },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "build extension",
+      "dependsOn": ["build server", "build client"],
+      "dependsOrder": "sequence",
+      "group": { "kind": "build", "isDefault": true }
+    }
+  ]
+}

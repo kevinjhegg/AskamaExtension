@@ -1,0 +1,5 @@
+{
+  "comment": "Stand-in for VS Code's CSS grammar, which the HTML grammar includes.",
+  "scopeName": "source.css",
+  "patterns": []
+}

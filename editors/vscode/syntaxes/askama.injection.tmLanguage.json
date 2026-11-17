@@ -1,0 +1,170 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Askama",
+  "scopeName": "askama.injection",
+  "comment": "Askama tags injected into HTML. Excluded inside its own tags and inside raw blocks, so it never matches twice.",
+  "injectionSelector": "L:text.html -comment.block.askama -meta.raw.askama -meta.embedded.expression.askama -meta.embedded.statement.askama",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#raw" },
+    { "include": "#statement" },
+    { "include": "#expression-tag" }
+  ],
+  "repository": {
+    "comment": {
+      "comment": "Askama comments nest, so a comment may contain another.",
+      "begin": "\\{#[-+~]?",
+      "end": "[-+~]?#\\}",
+      "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.askama" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.comment.end.askama" } },
+      "name": "comment.block.askama",
+      "patterns": [{ "include": "#comment" }]
+    },
+    "raw": {
+      "comment": "Askama leaves everything between raw and endraw alone, so only HTML is colored there.",
+      "begin": "(\\{%[-+~]?)\\s*(raw)\\s*([-+~]?%\\})",
+      "end": "(\\{%[-+~]?)\\s*(endraw)\\s*([-+~]?%\\})",
+      "beginCaptures": {
+        "1": { "name": "punctuation.section.embedded.begin.askama" },
+        "2": { "name": "keyword.control.askama" },
+        "3": { "name": "punctuation.section.embedded.end.askama" }
+      },
+      "endCaptures": {
+        "1": { "name": "punctuation.section.embedded.begin.askama" },
+        "2": { "name": "keyword.control.askama" },
+        "3": { "name": "punctuation.section.embedded.end.askama" }
+      },
+      "contentName": "meta.raw.askama",
+      "patterns": [{ "include": "text.html.basic" }]
+    },
+    "statement": {
+      "begin": "\\{%[-+~]?",
+      "end": "[-+~]?%\\}",
+      "beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.askama" } },
+      "endCaptures": { "0": { "name": "punctuation.section.embedded.end.askama" } },
+      "name": "meta.embedded.statement.askama",
+      "patterns": [
+        { "include": "#statement-keywords" },
+        { "include": "#expression" }
+      ]
+    },
+    "expression-tag": {
+      "begin": "\\{\\{[-+~]?",
+      "end": "[-+~]?\\}\\}",
+      "beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.askama" } },
+      "endCaptures": { "0": { "name": "punctuation.section.embedded.end.askama" } },
+      "name": "meta.embedded.expression.askama",
+      "patterns": [{ "include": "#expression" }]
+    },
+    "statement-keywords": {
+      "patterns": [
+        {
+          "match": "\\b(block|endblock)\\b(?:\\s+([A-Za-z_]\\w*))?",
+          "captures": {
+            "1": { "name": "keyword.control.askama" },
+            "2": { "name": "entity.name.type.block.askama" }
+          }
+        },
+        {
+          "match": "\\b(macro|endmacro)\\b(?:\\s+([A-Za-z_]\\w*))?",
+          "captures": {
+            "1": { "name": "keyword.control.askama" },
+            "2": { "name": "entity.name.function.macro.askama" }
+          }
+        },
+        {
+          "match": "\\b(filter)\\s+([A-Za-z_]\\w*)",
+          "captures": {
+            "1": { "name": "keyword.control.askama" },
+            "2": { "name": "support.function.filter.askama" }
+          }
+        },
+        {
+          "match": "\\b(if|else|elif|endif|for|in|endfor|break|continue|match|when|endwhen|endmatch|let|set|endlet|endset|filter|endfilter|call|endcall|extends|include|import|as|is|not|defined|decl|declare)\\b",
+          "name": "keyword.control.askama"
+        },
+        {
+          "match": "\\b(ref|mut)\\b",
+          "name": "storage.modifier.askama"
+        }
+      ]
+    },
+    "expression": {
+      "patterns": [
+        { "include": "#strings" },
+        {
+          "match": "\\b(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d[\\d_]*)?)(?:[iu](?:8|16|32|64|128|size)|f32|f64)?\\b",
+          "name": "constant.numeric.askama"
+        },
+        {
+          "match": "\\b(true|false)\\b",
+          "name": "constant.language.boolean.askama"
+        },
+        {
+          "match": "\\b(loop|self|Self|super|caller|crate)\\b",
+          "name": "variable.language.askama"
+        },
+        {
+          "comment": "Listed before filters, so || is an operator and not an empty filter.",
+          "match": "\\|\\||&&|==|!=|<=|>=|\\.\\.=?|[+\\-*/%<>!=~]|\\b(?:bitand|bitor|xor|as)\\b",
+          "name": "keyword.operator.askama"
+        },
+        {
+          "match": "(\\|)\\s*([A-Za-z_]\\w*)",
+          "captures": {
+            "1": { "name": "keyword.operator.filter.askama" },
+            "2": { "name": "support.function.filter.askama" }
+          }
+        },
+        {
+          "match": "\\b([A-Za-z_]\\w*)\\s*(::)",
+          "captures": {
+            "1": { "name": "entity.name.namespace.askama" },
+            "2": { "name": "punctuation.separator.namespace.askama" }
+          }
+        },
+        {
+          "match": "(\\.)\\s*([A-Za-z_]\\w*)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "punctuation.accessor.askama" },
+            "2": { "name": "entity.name.function.member.askama" }
+          }
+        },
+        {
+          "match": "(\\.)\\s*([A-Za-z_]\\w*|\\d+)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.askama" },
+            "2": { "name": "variable.other.property.askama" }
+          }
+        },
+        {
+          "match": "\\b([A-Za-z_]\\w*)\\s*(?=\\()",
+          "captures": { "1": { "name": "entity.name.function.askama" } }
+        },
+        {
+          "match": "\\b[A-Za-z_]\\w*\\b",
+          "name": "variable.other.askama"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "begin": "[bc]?r(#*)\"",
+          "end": "\"\\1",
+          "name": "string.quoted.double.raw.askama"
+        },
+        {
+          "begin": "[bc]?\"",
+          "end": "\"",
+          "name": "string.quoted.double.askama",
+          "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.askama" }]
+        },
+        {
+          "match": "b?'(?:\\\\.|[^\\\\'])'",
+          "name": "string.quoted.single.askama"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["analysis", "server"]
+# The sample crate is the extension's test bed, not part of the extension. It has its own
+# Cargo.lock and target directory, so building the server never builds it.
+exclude = ["fixtures/sample-site"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tower-lsp-server = "0.23"
+askama-analysis = { path = "analysis" }
+# Pinned to the exact release the fixture uses: see docs/design.md, "Versions".
+askama_parser = { version = "=0.16.1", features = ["config"] }
+glob = "0.3"
+# span-locations gives syn's spans line and column outside a proc macro, to locate filters.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syn = { version = "2", features = ["full"] }
+toml = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

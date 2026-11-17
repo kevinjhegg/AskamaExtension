@@ -1,0 +1,18 @@
+[package]
+name = "askama-analysis"
+description = "Analysis of Askama templates for askama-lsp, independent of the Language Server Protocol."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+askama_parser.workspace = true
+glob.workspace = true
+proc-macro2.workspace = true
+quote.workspace = true
+serde.workspace = true
+syn.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

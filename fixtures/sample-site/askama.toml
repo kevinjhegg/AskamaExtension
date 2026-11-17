@@ -1,0 +1,5 @@
+# Askama's configuration for the sample crate. These are the defaults written out, so the
+# extension's handling of askama.toml can be tried: a mistake here shows as an error on
+# this file, and the templates are checked against the syntax it sets.
+[general]
+dirs = ["templates"]

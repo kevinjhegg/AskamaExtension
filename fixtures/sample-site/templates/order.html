@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+{# The order's header, then one row per line item. #}
+<h1>Order {{ order.id }} for {{ order.customer.name|upper }}</h1>
+<p><a href="mailto:{{ order.customer.email }}">{{ order.customer.email }}</a></p>
+
+<table>
+  {% for item in order.items %}
+  <tr id="item-{{ loop.index }}">
+    <td>{{ item.sku }}</td>
+    <td class="number">{{ item.quantity }}</td>
+    {% call m::money_cell(item.total_cents()) %}{% endcall %}
+  </tr>
+  {% endfor %}
+</table>
+
+<button hx-get="/orders/{{ order.id }}/refresh" hx-target="#content" hx-swap="innerHTML">
+  Refresh
+</button>
+{% endblock %}

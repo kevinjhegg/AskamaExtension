@@ -1,0 +1,5 @@
+{
+  "comment": "Stand-in for VS Code's JavaScript grammar, so the tests can check where JavaScript is embedded without vendoring the real one.",
+  "scopeName": "source.js",
+  "patterns": [{ "match": "\\w+", "name": "variable.other.js" }]
+}
