@@ -693,10 +693,11 @@ impl Backend {
     /// Every crate in the workspace folders and every crate with an open template. The folders are searched again only once
     /// `CRATE_ROOTS_LIFETIME` has passed.
     fn crate_roots(&self) -> Vec<PathBuf> {
-        let (folders, found, configured) = {
+        let (folders, found, configured, open) = {
             let state = self.lock();
             let found = state.crate_roots.as_ref().filter(|(when, _)| when.elapsed() < CRATE_ROOTS_LIFETIME).map(|(_, roots)| roots.clone());
-            (state.folders.clone(), found, state.configs.keys().cloned().collect::<Vec<_>>())
+            let open: Vec<Uri> = state.documents.iter().filter(|(_, document)| !document.rust).map(|(uri, _)| uri.clone()).collect();
+            (state.folders.clone(), found, state.configs.keys().cloned().collect::<Vec<_>>(), open)
         };
         let mut roots = found.unwrap_or_else(|| {
             let roots: Vec<PathBuf> = folders.iter().flat_map(|folder| project::crates_under(folder)).collect();
@@ -704,12 +705,15 @@ impl Backend {
             roots
         });
         roots.extend(configured);
+        // An open template's crate counts even before its check has read the crate's configuration, which a request right after opening
+        // it can come before.
+        roots.extend(open.iter().filter_map(|uri| uri.to_file_path().and_then(|path| project::crate_root(&path))));
         roots.sort();
         roots.dedup();
         roots
     }
 
-    /// Asks the client to report changes to any `askama.toml`. Asks the client to report changes to any `askama.toml` and any Rust file.
+    /// Asks the client to report changes to any `askama.toml` and any Rust file.
     /// Once Rust files are watched, the Rust index trusts what it has read until a change is reported, rather than checking every file of
     /// `src` on every request.
     async fn watch_config_files(&self) {
