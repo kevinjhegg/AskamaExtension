@@ -9,12 +9,12 @@
   "icon": "icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/kevinjhegg/AskamaExtension.git"
+    "url": "https://github.com/kevinjhegg/askama-vscode.git"
   },
   "bugs": {
-    "url": "https://github.com/kevinjhegg/AskamaExtension/issues"
+    "url": "https://github.com/kevinjhegg/askama-vscode/issues"
   },
-  "homepage": "https://github.com/kevinjhegg/AskamaExtension#readme",
+  "homepage": "https://github.com/kevinjhegg/askama-vscode#readme",
   "keywords": [
     "askama",
     "rust",
