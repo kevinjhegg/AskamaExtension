@@ -4,3 +4,4 @@
 /editors/vscode/out/
 /editors/vscode/server/
 *.vsix
+__pycache__/

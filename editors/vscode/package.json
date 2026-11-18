@@ -2,7 +2,7 @@
   "name": "askama-vscode",
   "displayName": "Askama IntelliSense",
   "description": "Highlighting, navigation and completion for Askama templates in Rust projects.",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "publisher": "local",
   "private": true,
   "license": "MIT",
