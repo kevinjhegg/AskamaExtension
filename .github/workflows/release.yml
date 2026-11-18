@@ -1,0 +1,146 @@
+# Builds, tests and packages Askama IntelliSense for every platform VS Code runs on, and publishes a release.
+#
+# Every push to main and every pull request builds and tests all five platforms and keeps their VSIX files as the run's artifacts. A tag
+# `v<version>`, matching `version` in editors/vscode/package.json, also publishes them: to the Visual Studio Marketplace (secret
+# VSCE_PAT), to Open VSX when the secret OVSX_PAT is set, and as a GitHub release with the changelog's section for the version.
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch replaces a run still going; a release tag always runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-latest
+          # Built on Apple silicon for Intel Macs. Its tests cannot run there, so they run only on the other four.
+          - target: darwin-x64
+            os: macos-latest
+            rust: x86_64-apple-darwin
+          - target: linux-x64
+            os: ubuntu-latest
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: win32-x64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Lint
+        if: matrix.target == 'linux-x64'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The tests that need rust-analyzer skip themselves, saying so, since the runners have none.
+      - name: Test the server
+        if: matrix.rust == ''
+        run: cargo test --workspace
+
+      - name: Package
+        shell: bash
+        env:
+          VSCODE_TARGET: ${{ matrix.target }}
+          CARGO_BUILD_TARGET: ${{ matrix.rust }}
+        run: sh scripts/package.sh
+
+      - name: Test the client
+        if: matrix.target == 'linux-x64'
+        working-directory: editors/vscode
+        run: npm run compile && npm test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix-${{ matrix.target }}
+          path: askama-vscode-${{ matrix.target }}-*.vsix
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      # To create the GitHub release.
+      contents: write
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Check the tag against the version
+        run: |
+          version=$(node -p "require('./editors/vscode/package.json').version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match version $version in editors/vscode/package.json."
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vsix-*
+          merge-multiple: true
+          path: dist
+
+      # vsce and ovsx, at the versions package-lock.json holds.
+      - name: Install the publishing tools
+        working-directory: editors/vscode
+        run: npm ci --no-audit --no-fund
+
+      - name: Publish to the Visual Studio Marketplace
+        working-directory: editors/vscode
+        run: npx vsce publish --packagePath ../../dist/*.vsix
+
+      - name: Publish to Open VSX
+        if: env.OVSX_PAT != ''
+        working-directory: editors/vscode
+        run: |
+          for vsix in ../../dist/*.vsix; do
+            npx ovsx publish "$vsix" -p "$OVSX_PAT"
+          done
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The changelog's section for this version, without its heading.
+          awk -v heading="## $VERSION " 'index($0, heading) == 1 { found = 1; next } found && /^## / { exit } found' editors/vscode/CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/*.vsix --title "$GITHUB_REF_NAME" --notes-file notes.md

@@ -1,0 +1,4 @@
+# Keep LF line endings in every checkout, Windows included: the tests and the templates expect them.
+* text=auto eol=lf
+*.png binary
+*.vsix binary

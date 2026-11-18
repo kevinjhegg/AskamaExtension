@@ -173,7 +173,8 @@ impl Drop for Crate {
     }
 }
 
+/// The `file://` URI of a path, made as the server makes them, so it is also right for a Windows path (`file:///C:/...`).
 pub fn uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    tower_lsp_server::ls_types::Uri::from_file_path(path).expect("an absolute path").as_str().to_owned()
 }
 
