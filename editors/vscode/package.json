@@ -3,7 +3,7 @@
   "displayName": "Askama IntelliSense",
   "description": "Highlighting, navigation and completion for Askama templates in Rust projects.",
   "version": "1.0.0",
-  "publisher": "local",
+  "publisher": "kevinhegg",
   "private": true,
   "license": "MIT",
   "icon": "icon.png",
