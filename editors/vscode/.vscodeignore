@@ -8,3 +8,5 @@ out/**
 **/*.map
 tsconfig.json
 .vscode/**
+# The icon's source; the package carries icon.png, rendered from it at 256 pixels.
+icon.svg

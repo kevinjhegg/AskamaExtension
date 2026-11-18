@@ -5,3 +5,5 @@
 /editors/vscode/server/
 *.vsix
 __pycache__/
+# Copied from the root LICENSE by scripts/package.sh.
+/editors/vscode/LICENSE

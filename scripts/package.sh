@@ -21,7 +21,7 @@ cd editors/vscode
 # Exactly what package-lock.json holds, never newer versions a fresh resolution would pick.
 npm ci --no-audit --no-fund
 version=$(node -p "require('./package.json').version")
-# vscode:prepublish bundles the client. The bundle holds every dependency, so none are packed;
-# the extension is private, so it has no license file or repository to show.
-npx vsce package --target "$target" --no-dependencies --skip-license --allow-missing-repository \
-  --out "../../askama-vscode-$target-$version.vsix"
+# vscode:prepublish bundles the client. The bundle holds every dependency, so none are packed.
+# editors/vscode/LICENSE is a copy of the repository's LICENSE, which vsce needs beside the manifest.
+cp ../../LICENSE LICENSE
+npx vsce package --target "$target" --no-dependencies --out "../../askama-vscode-$target-$version.vsix"

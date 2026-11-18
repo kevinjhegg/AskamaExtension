@@ -6,6 +6,22 @@
   "publisher": "local",
   "private": true,
   "license": "MIT",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kevinjhegg/AskamaExtension.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kevinjhegg/AskamaExtension/issues"
+  },
+  "homepage": "https://github.com/kevinjhegg/AskamaExtension#readme",
+  "keywords": [
+    "askama",
+    "rust",
+    "templates",
+    "jinja",
+    "htmx"
+  ],
   "engines": {
     "vscode": "^1.146.0"
   },
