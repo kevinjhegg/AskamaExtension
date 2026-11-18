@@ -1,6 +1,5 @@
-//! End-to-end test of member completion through a private rust-analyzer. It needs a
-//! rust-analyzer: `ASKAMA_TEST_RUST_ANALYZER`, else the one VS Code's rust-analyzer extension
-//! ships, else `rust-analyzer` on the PATH. Without one it is skipped, saying so.
+//! End-to-end test of member completion through a private rust-analyzer. It needs a rust-analyzer: `ASKAMA_TEST_RUST_ANALYZER`, else the
+//! one VS Code's rust-analyzer extension ships, else `rust-analyzer` on the PATH. Without one it is skipped, saying so.
 
 mod common;
 
@@ -59,7 +58,7 @@ fn completion(server: &mut Session, uri: &str, line: u32, character: u32) -> Val
 }
 
 fn labels(items: &Value) -> Vec<String> {
-    let mut labels: Vec<String> = items.as_array().map(|items| items.iter().map(|item| item["label"].as_str().unwrap().to_owned()).collect()).unwrap_or_default();
+    let mut labels: Vec<String> = items.as_array().map_or_else(Vec::new, |items| items.iter().map(|item| item["label"].as_str().unwrap().to_owned()).collect());
     labels.sort();
     labels
 }
@@ -139,6 +138,36 @@ const SCOPED_PAGE: &str = "\
 
 const MACROS: &str = "{% macro cell(n) %}{{ n. }}{% endmacro %}\n";
 
+/// Chains with a method call and an index before the `.`.
+const CHAINED_PAGE: &str = "{{ order.items.first().unwrap(). }}\n{{ order.items[0]. }}\n";
+
+#[test]
+fn completes_members_after_calls_and_indexing() {
+    let Some(program) = rust_analyzer() else {
+        eprintln!("skipped: no rust-analyzer found (set ASKAMA_TEST_RUST_ANALYZER)");
+        return;
+    };
+    let krate = Crate::new();
+    krate.write("src/main.rs", SCOPED_MAIN);
+    krate.write("templates/page.html", CHAINED_PAGE);
+    let page = krate.uri("templates/page.html");
+    let mut server = Session::start_with(json!({ "rustAnalyzerPath": program }));
+    server.open(&page, CHAINED_PAGE);
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let first = loop {
+        let items = labels(&completion(&mut server, &page, 0, 32));
+        if !items.is_empty() {
+            break items;
+        }
+        assert!(Instant::now() < deadline, "rust-analyzer never answered");
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    assert!(first.contains(&"sku".to_owned()) && first.contains(&"total".to_owned()), "after first().unwrap(): {first:?}");
+    let indexed = labels(&completion(&mut server, &page, 1, 18));
+    assert!(indexed.contains(&"quantity".to_owned()), "after [0]: {indexed:?}");
+}
+
 #[test]
 fn completes_members_of_loop_variables_lets_and_macro_arguments() {
     let Some(program) = rust_analyzer() else {
@@ -180,11 +209,11 @@ fn completes_members_of_loop_variables_lets_and_macro_arguments() {
 
 #[test]
 fn hovers_finds_and_checks_deep_paths() {
+    const DEEP: &str = "{{ order.customer.name }}\n{{ order.customer.mail }}\n";
     let Some(program) = rust_analyzer() else {
         eprintln!("skipped: no rust-analyzer found (set ASKAMA_TEST_RUST_ANALYZER)");
         return;
     };
-    const DEEP: &str = "{{ order.customer.name }}\n{{ order.customer.mail }}\n";
     let krate = Crate::new();
     krate.write("src/main.rs", MAIN);
     krate.write("templates/page.html", DEEP);

@@ -1,5 +1,4 @@
-//! End-to-end tests of the structural requests: document symbols, folding ranges and
-//! selection ranges.
+//! End-to-end tests of the structural requests: document symbols, folding ranges and selection ranges.
 
 mod common;
 

@@ -1,15 +1,16 @@
-//! The names a template binds itself and where each is visible: `for` loop variables and the
-//! loop's `loop`, `let` and `set`, macro arguments, `match` arms and `if let`.
+//! The names a template binds itself and where each is visible: `for` loop variables and the loop's `loop`, `let` and `set`, macro
+//! arguments, `match` arms and `if let`.
 //!
-//! Only the names are known, not their types (steps 9 and 10 add those). Patterns are read
-//! with a few rules rather than a Rust parser: a binding is a lowercase identifier that is not
-//! a path segment, a constructor (`Some(x)`), a struct name or a field label (`name: n`).
+//! Only the names are known, not their types (rust-analyzer supplies those). Patterns are read with a few rules rather than a Rust parser:
+//! a binding is a lowercase identifier that is not a path segment, a constructor (`Some(x)`), a struct name or a field label (`name: n`).
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use crate::navigation::{Ident, NOT_EXPRESSIONS, variable_at};
 use crate::outline::{Region, RegionKind};
-use crate::tags::{Tag, TagKind, literal_end};
+use crate::tags::{self, Tag, TagKind, literal_end, next_char};
+use crate::text::{call_parts, if_let, is_word_char, rest_range, split_top_level, starts_word, top_level_assignment, top_level_type_colon, top_level_word, word_length};
 
 /// What `loop` offers inside a `for` loop.
 pub const LOOP_MEMBERS: &[(&str, &str)] = &[
@@ -26,14 +27,19 @@ const NOT_VARIABLES: &[&str] = &[
     "self", "set", "super", "true", "when", "with",
 ];
 
+/// What binds a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingKind {
     /// A name in a `for` loop's pattern.
     LoopVariable,
     /// The `loop` value inside a `for` loop.
     Loop,
+    /// A name in a `let` or `set` pattern.
     Let,
+    /// One of a macro's arguments.
     MacroArgument,
+    /// A caller parameter of a `{% call %}` block (`user` in `{% call(user) list(users) %}`), which the macro passes through `caller(...)`.
+    CallerArgument,
     /// A name in a `when` pattern.
     MatchArm,
     /// A name in an `if let` or `elif let` pattern.
@@ -43,27 +49,30 @@ pub enum BindingKind {
 /// A name the template binds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
+    /// The bound name.
     pub name: String,
+    /// What binds it.
     pub kind: BindingKind,
     /// Where the name is written. For `loop`, the `for` tag.
     pub range: Range<usize>,
     /// Where the name can be used.
     pub scope: Range<usize>,
-    /// What gives it its value: the iterated or assigned expression, the macro's name, or
-    /// the pattern of a `when` or `if let`.
+    /// What gives it its value: the iterated or assigned expression, the macro's name, or the pattern of a `when` or `if let`.
     pub origin: String,
 }
 
 /// Every name the template binds.
 pub fn bindings(source: &str, tags: &[Tag], regions: &[Region]) -> Vec<Binding> {
-    let tag_at = |start: usize| tags.iter().find(|tag| tag.range.start == start);
+    let tag_at = |start: usize| tags::starting_at(tags, start);
     let mut found = Vec::new();
+    // The block form of `let` binds its name after `endlet`: where each such block ends.
+    let mut let_block_ends = std::collections::HashMap::new();
 
     for region in Region::walk(regions) {
         let Some(opener) = tag_at(region.opener.start) else {
             continue;
         };
-        let body_end = region.branches.first().map(|branch| branch.start).or(region.closer.as_ref().map(|closer| closer.start)).unwrap_or(region.range.end);
+        let body_end = region.branches.first().map(|branch| branch.start).or_else(|| region.closer.as_ref().map(|closer| closer.start)).unwrap_or(region.range.end);
         let body = opener.range.end..body_end;
         match region.kind {
             RegionKind::For => {
@@ -76,19 +85,35 @@ pub fn bindings(source: &str, tags: &[Tag], regions: &[Region]) -> Vec<Binding> 
                 for (name, range) in pattern_names(source, rest.start..in_at) {
                     found.push(Binding { name, kind: BindingKind::LoopVariable, range, scope: body.clone(), origin: iterated.to_owned() });
                 }
-                found.push(Binding { name: "loop".to_owned(), kind: BindingKind::Loop, range: opener.range.clone(), scope: body.clone(), origin: iterated.to_owned() });
+                found.push(Binding { name: "loop".to_owned(), kind: BindingKind::Loop, range: opener.range.clone(), scope: body, origin: iterated.to_owned() });
             }
             RegionKind::Macro => {
                 let rest = rest_range(source, opener);
                 let text = &source[rest.clone()];
-                let name = text.trim_start().split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or("").to_owned();
+                let name = text.trim_start().split(|c: char| !is_word_char(c)).next().unwrap_or("").to_owned();
+                // `{% macro m) (a %}` has its brackets the wrong way round: no arguments.
                 let (Some(open), Some(close)) = (text.find('('), text.rfind(')')) else {
                     continue;
                 };
+                if open > close {
+                    continue;
+                }
                 for argument in split_top_level(source, rest.start + open + 1..rest.start + close, b',') {
                     // Each argument is `name`, `name = default` or `name: Type`.
                     if let Some((arg, range)) = leading_identifier(source, argument) {
                         found.push(Binding { name: arg, kind: BindingKind::MacroArgument, range, scope: body.clone(), origin: name.clone() });
+                    }
+                }
+            }
+            RegionKind::Call => {
+                // `{% call(user) list(users) %}`: the macro gives `user` its value each time it calls `caller(...)`.
+                let (Some(parameters), name_start) = call_parts(source, opener) else {
+                    continue;
+                };
+                let name = source[name_start..opener.inner.end].split(|c: char| !(is_word_char(c) || c == ':')).next().unwrap_or("").to_owned();
+                for parameter in split_top_level(source, parameters, b',') {
+                    if let Some((parameter, range)) = leading_identifier(source, parameter) {
+                        found.push(Binding { name: parameter, kind: BindingKind::CallerArgument, range, scope: body.clone(), origin: name.clone() });
                     }
                 }
             }
@@ -110,21 +135,20 @@ pub fn bindings(source: &str, tags: &[Tag], regions: &[Region]) -> Vec<Binding> 
                 let branch_tags = std::iter::once(opener).chain(region.branches.iter().filter_map(|branch| tag_at(branch.start)));
                 let boundaries: Vec<usize> = region.branches.iter().map(|branch| branch.start).chain(region.closer.as_ref().map(|closer| closer.start)).chain(std::iter::once(region.range.end)).collect();
                 for (index, tag) in branch_tags.enumerate() {
-                    let rest = rest_range(source, tag);
-                    let text = &source[rest.clone()];
                     // `if let`, `elif let` and `else if let`.
-                    let Some(let_at) = text.find("let ").filter(|&at| text[..at].trim().is_empty() || text[..at].trim() == "if") else {
+                    let Some((pattern, value)) = if_let(source, tag) else {
                         continue;
                     };
-                    let after_let = rest.start + let_at + 3;
-                    let Some(equals) = top_level_assignment(source, after_let..rest.end) else {
-                        continue;
-                    };
-                    let origin = format!("if let {}", source[after_let..rest.end].trim());
+                    let origin = format!("if let {}", source[pattern.start..value.end].trim());
                     let scope = tag.range.end..boundaries[index];
-                    for (name, range) in pattern_names(source, after_let..equals) {
+                    for (name, range) in pattern_names(source, pattern) {
                         found.push(Binding { name, kind: BindingKind::IfLet, range, scope: scope.clone(), origin: origin.clone() });
                     }
+                }
+            }
+            RegionKind::Let => {
+                if let Some(closer) = &region.closer {
+                    let_block_ends.insert(region.opener.start, closer.end);
                 }
             }
             _ => {}
@@ -134,13 +158,9 @@ pub fn bindings(source: &str, tags: &[Tag], regions: &[Region]) -> Vec<Binding> 
     for tag in tags.iter().filter(|tag| tag.kind == TagKind::Block && matches!(tag.keyword(source), "let" | "set")) {
         let rest = rest_range(source, tag);
         let equals = top_level_assignment(source, rest.clone());
-        // The block form binds its name after `endlet`.
         let start = match equals {
             Some(_) => tag.range.end,
-            None => Region::walk(regions)
-                .find(|region| region.kind == RegionKind::Let && region.opener.start == tag.range.start)
-                .and_then(|region| region.closer.as_ref().map(|closer| closer.end))
-                .unwrap_or(tag.range.end),
+            None => let_block_ends.get(&tag.range.start).copied().unwrap_or(tag.range.end),
         };
         let pattern_end = equals.unwrap_or(rest.end);
         let pattern_end = top_level_type_colon(source, rest.start..pattern_end).unwrap_or(pattern_end);
@@ -157,8 +177,8 @@ pub fn bindings(source: &str, tags: &[Tag], regions: &[Region]) -> Vec<Binding> 
 pub fn visible_at(bindings: &[Binding], offset: usize) -> Vec<&Binding> {
     let mut visible: Vec<&Binding> = bindings.iter().filter(|binding| binding.scope.start <= offset && offset <= binding.scope.end).collect();
     visible.sort_by_key(|binding| (binding.scope.len(), std::cmp::Reverse(binding.range.start)));
-    let mut seen = std::collections::HashSet::new();
-    visible.retain(|binding| seen.insert(binding.name.clone()));
+    let mut seen = HashSet::new();
+    visible.retain(|binding| seen.insert(binding.name.as_str()));
     visible
 }
 
@@ -171,11 +191,14 @@ pub fn binding_at<'b>(source: &str, tags: &[Tag], bindings: &'b [Binding], offse
     visible_at(bindings, variable.range.start).into_iter().find(|binding| binding.name == variable.name)
 }
 
-/// The `loop` member at `offset` (`index` in `loop.index`) inside a `for` loop, with its
-/// description and range.
+/// The `loop` member at `offset` (`index` in `loop.index`) inside a `for` loop, with its description and range. `None` also for an offset
+/// that is not on a character boundary.
 pub fn loop_member_at(source: &str, bindings: &[Binding], offset: usize) -> Option<(&'static str, &'static str, Range<usize>)> {
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let is_word = is_word_char;
     let offset = offset.min(source.len());
+    if !source.is_char_boundary(offset) {
+        return None;
+    }
     let start = source[..offset].trim_end_matches(is_word).len();
     let end = offset + source[offset..].find(|c: char| !is_word(c)).unwrap_or(source.len() - offset);
     let object = source[..start].strip_suffix("loop.")?;
@@ -187,14 +210,15 @@ pub fn loop_member_at(source: &str, bindings: &[Binding], offset: usize) -> Opti
     Some((name, description, start..end))
 }
 
-/// Every place a binding is written or used, the binding itself first.
+/// Every place a binding is written or used, the binding itself first. `binding` must be one of `bindings`, since a use counts only where
+/// that very binding is the one visible.
 pub fn occurrences(source: &str, tags: &[Tag], bindings: &[Binding], binding: &Binding) -> Vec<Range<usize>> {
     let mut found = vec![binding.range.clone()];
     for used in variable_uses(source, tags, bindings) {
         if used.name == binding.name
             && binding.scope.start <= used.range.start
             && used.range.end <= binding.scope.end
-            && visible_at(bindings, used.range.start).into_iter().find(|visible| visible.name == used.name) == Some(binding)
+            && visible_at(bindings, used.range.start).into_iter().find(|visible| visible.name == used.name).is_some_and(|visible| std::ptr::eq(visible, binding))
         {
             found.push(used.range);
         }
@@ -202,12 +226,12 @@ pub fn occurrences(source: &str, tags: &[Tag], bindings: &[Binding], binding: &B
     found
 }
 
-/// Every variable used in the template's expressions: each identifier that is a variable
-/// (see `variable_at`), is not a word of the syntax, is not called (`f(` or `m!`), starts
-/// lowercase, is not where a binding is written, and is not a named argument
-/// (`m::cell(x, width = 3)`, where `width` names the macro's parameter).
+/// Every variable used in the template's expressions: each identifier that is a variable (see `variable_at`), is not a word of the syntax,
+/// is not called (`f(` or `m!`), starts lowercase, is not where a binding is written, and is not a named argument (`m::cell(x, width = 3)`,
+/// where `width` names the macro's parameter).
 pub fn variable_uses(source: &str, tags: &[Tag], bindings: &[Binding]) -> Vec<Ident> {
     let mut uses = Vec::new();
+    let binding_starts: HashSet<usize> = bindings.iter().map(|binding| binding.range.start).collect();
     for tag in tags.iter().filter(|tag| matches!(tag.kind, TagKind::Expr | TagKind::Block)) {
         if let Some(range) = expression_part(source, tag) {
             let mut at = range.start;
@@ -217,22 +241,20 @@ pub fn variable_uses(source: &str, tags: &[Tag], bindings: &[Binding]) -> Vec<Id
                     continue;
                 }
                 let rest = &source[at..range.end];
-                let starts_word = rest.starts_with(|c: char| c.is_alphabetic() || c == '_')
-                    && !source[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_');
-                if !starts_word {
-                    at += rest.chars().next().map_or(1, char::len_utf8);
+                if !starts_word(source, at) {
+                    at = next_char(source, at);
                     continue;
                 }
-                let length = rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len());
+                let length = word_length(rest);
                 let word = &rest[..length];
                 let after = source[at + length..range.end].trim_start();
                 let used = word.starts_with(|c: char| c.is_lowercase() || c == '_')
                     && word != "_"
                     && !NOT_VARIABLES.contains(&word)
                     && !after.starts_with(['(', '!'])
-                    && !(after.starts_with(':') && !after.starts_with("::"))
+                    && (!after.starts_with(':') || after.starts_with("::"))
                     && !is_named_argument(after)
-                    && !bindings.iter().any(|binding| binding.range.start == at)
+                    && !binding_starts.contains(&at)
                     && variable_at(source, tags, at).is_some_and(|variable| variable.range.start == at);
                 if used {
                     uses.push(Ident { name: word.to_owned(), range: at..at + length });
@@ -264,9 +286,8 @@ pub fn expression_part(source: &str, tag: &Tag) -> Option<Range<usize>> {
         "if" | "elif" | "else" => {
             let text = &source[rest.clone()];
             match text.find("let ") {
-                Some(let_at) if text[..let_at].trim().is_empty() || text[..let_at].trim() == "if" => {
-                    top_level_assignment(source, rest.start + let_at + 3..rest.end).map(|at| at + 1..rest.end)
-                }
+                // `if let`: only the value is an expression, and nothing is when it has no `=`.
+                Some(let_at) if text[..let_at].trim().is_empty() || text[..let_at].trim() == "if" => if_let(source, tag).map(|(_, value)| value),
                 _ => Some(rest),
             }
         }
@@ -274,14 +295,8 @@ pub fn expression_part(source: &str, tag: &Tag) -> Option<Range<usize>> {
     }
 }
 
-/// The range of a tag's text after its keyword.
-fn rest_range(source: &str, tag: &Tag) -> Range<usize> {
-    let start = tag.inner.start + tag.keyword(source).len();
-    start.min(tag.inner.end)..tag.inner.end
-}
-
-/// Where the region segment holding `at` ends: the next branch or closing tag of the
-/// innermost region whose body holds it, or the end of the text.
+/// Where the region segment holding `at` ends: the next branch or closing tag of the innermost region whose body holds it, or the end of
+/// the text.
 fn segment_end(source: &str, regions: &[Region], at: usize) -> usize {
     let holding = Region::walk(regions)
         .filter(|region| region.opener.end <= at && region.closer.as_ref().map_or(region.range.end, |closer| closer.start) > at)
@@ -309,12 +324,11 @@ fn pattern_names(source: &str, range: Range<usize>) -> Vec<(String, Range<usize>
             continue;
         }
         let rest = &source[at..range.end];
-        let starts_word = rest.starts_with(|c: char| c.is_alphabetic() || c == '_') && !source[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_');
-        if !starts_word {
-            at += rest.chars().next().map_or(1, char::len_utf8);
+        if !starts_word(source, at) {
+            at = next_char(source, at);
             continue;
         }
-        let length = rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len());
+        let length = word_length(rest);
         let word = &rest[..length];
         let before = source[range.start..at].trim_end();
         let after = source[at + length..range.end].trim_start();
@@ -340,71 +354,8 @@ fn leading_identifier(source: &str, range: Range<usize>) -> Option<(String, Rang
     if !rest.starts_with(|c: char| c.is_alphabetic() || c == '_') {
         return None;
     }
-    let length = rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len());
+    let length = word_length(rest);
     Some((rest[..length].to_owned(), start..start + length))
-}
-
-/// Where `word` appears as a whole word outside brackets and literals.
-fn top_level_word(source: &str, range: Range<usize>, word: &str) -> Option<usize> {
-    top_level_positions(source, range).find(|&at| {
-        source[at..].starts_with(word)
-            && !source[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_')
-            && !source[at + word.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
-    })
-}
-
-/// Where a single `=` (not `==`, `!=`, `<=`, `>=` or `=>`) appears outside brackets.
-fn top_level_assignment(source: &str, range: Range<usize>) -> Option<usize> {
-    let bytes = source.as_bytes();
-    top_level_positions(source, range).find(|&at| {
-        bytes[at] == b'='
-            && !matches!(at.checked_sub(1).map(|before| bytes[before]), Some(b'=' | b'!' | b'<' | b'>'))
-            && !matches!(bytes.get(at + 1), Some(b'=' | b'>'))
-    })
-}
-
-/// Where a type annotation's `:` (not `::`) appears outside brackets.
-fn top_level_type_colon(source: &str, range: Range<usize>) -> Option<usize> {
-    let bytes = source.as_bytes();
-    top_level_positions(source, range).find(|&at| bytes[at] == b':' && bytes.get(at + 1) != Some(&b':') && (at == 0 || bytes[at - 1] != b':'))
-}
-
-/// `range` split at each top-level `separator`.
-fn split_top_level(source: &str, range: Range<usize>, separator: u8) -> Vec<Range<usize>> {
-    let mut parts = Vec::new();
-    let mut start = range.start;
-    for at in top_level_positions(source, range.clone()) {
-        if source.as_bytes()[at] == separator {
-            parts.push(start..at);
-            start = at + 1;
-        }
-    }
-    parts.push(start..range.end);
-    parts
-}
-
-/// The byte positions in `range` that are outside brackets and literals.
-fn top_level_positions(source: &str, range: Range<usize>) -> impl Iterator<Item = usize> + '_ {
-    let mut depth = 0usize;
-    let mut at = range.start;
-    std::iter::from_fn(move || {
-        while at < range.end {
-            if let Some(end) = literal_end(source, at) {
-                at = end;
-                continue;
-            }
-            let here = at;
-            let byte = source.as_bytes()[here];
-            at += source[here..].chars().next().map_or(1, char::len_utf8);
-            match byte {
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-                _ if depth == 0 => return Some(here),
-                _ => {}
-            }
-        }
-        None
-    })
 }
 
 #[cfg(test)]
@@ -424,6 +375,26 @@ mod tests {
     fn sketch(source: &str) -> Vec<(String, BindingKind, String, String)> {
         let (_, bindings) = analyze(source);
         bindings.into_iter().map(|binding| (binding.name, binding.kind, source[binding.scope].to_owned(), binding.origin)).collect()
+    }
+
+    #[test]
+    fn binds_a_call_blocks_caller_parameters_in_its_body() {
+        let source = "{% call(user, i) m::list(users) %}A{{ user.name }}{% endcall %}{{ user }}";
+        assert_eq!(
+            sketch(source),
+            [
+                ("user".to_owned(), BindingKind::CallerArgument, "A{{ user.name }}".to_owned(), "m::list".to_owned()),
+                ("i".to_owned(), BindingKind::CallerArgument, "A{{ user.name }}".to_owned(), "m::list".to_owned()),
+            ]
+        );
+        // Inside the body `user` is bound, so it is not an unknown name there; after `endcall` it is not bound.
+        let (tags, bindings) = analyze(source);
+        let unbound: Vec<usize> = variable_uses(source, &tags, &bindings)
+            .into_iter()
+            .filter(|used| visible_at(&bindings, used.range.start).iter().all(|binding| binding.name != used.name))
+            .map(|used| used.range.start)
+            .collect();
+        assert_eq!(unbound, [source.rfind("user").unwrap()]);
     }
 
     #[test]
@@ -512,8 +483,8 @@ mod tests {
         let outer = &bindings[0];
         let found: Vec<usize> = occurrences(source, &tags, &bindings, outer).into_iter().map(|range| range.start).collect();
         let positions: Vec<usize> = source.match_indices('x').map(|(at, _)| at).collect();
-        // `for x` and `{{ x }}`, then, skipping the inner loop's `for x` and `{{ x }}`, `{{ x.y }}`.
-        // `xs` is another name, and the last `{{ x }}` is outside the loop.
+        // `for x` and `{{ x }}`, then, skipping the inner loop's `for x` and `{{ x }}`, `{{ x.y }}`. `xs` is another name, and the last
+        // `{{ x }}` is outside the loop.
         assert_eq!(found, [positions[0], positions[2], positions[5]]);
     }
 

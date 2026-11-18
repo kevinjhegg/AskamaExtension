@@ -1,5 +1,4 @@
-//! Template constructs as the Rust `askama_derive` 0.16 generates for them, for probes that need
-//! the names a template binds.
+//! Template constructs as the Rust `askama_derive` 0.16 generates for them, for probes that need the names a template binds.
 //!
 //! What the generated code does, and what a probe writes instead:
 //!
@@ -11,22 +10,26 @@
 //! | `{% match e %}{% when p %}` | `match &e { p => {` | `if let p = &e {` |
 //! | macro argument `a` given `v` | `let a = &(v);`, or `= v;` for a literal | the same |
 //!
-//! `ITER` is `e` for a range, `e.iter()` for an array, `(e).into_iter()` for a call or an index,
-//! `(&e).into_iter()` for a field of `self` or of anything else, and `(e).into_iter()` for a
-//! local. Inside expressions a name the template does not bind becomes `self.name`, as
+//! `ITER` is `e` for a range, `e.iter()` for an array, `(e).into_iter()` for a call or an index, `(&e).into_iter()` for a field of `self`
+//! or of anything else, and `(e).into_iter()` for a local. Inside expressions a name the template does not bind becomes `self.name`, as
 //! Askama's generated code reads it from the struct.
 
 use std::ops::Range;
 
 use crate::outline::{Region, RegionKind};
 use crate::scopes::{Binding, BindingKind, visible_at};
-use crate::tags::{Tag, TagKind, literal_end};
+use crate::tags::{self, Tag, TagKind, literal_end, next_char};
+use crate::text::{call_parts, if_let, rest_range as rest, split_top_level, starts_word, top_level_assignment as assignment, top_level_word as word_at, word_length};
 
 /// A template and what is known of it, for lowering.
 pub struct Template<'a> {
+    /// The template's text.
     pub source: &'a str,
+    /// Its tags.
     pub tags: &'a [Tag],
+    /// Its regions.
     pub regions: &'a [Region],
+    /// The names it binds.
     pub bindings: &'a [Binding],
     /// Whether a name is a field or method of the template's struct.
     pub is_member: &'a dyn Fn(&str) -> bool,
@@ -35,11 +38,14 @@ pub struct Template<'a> {
 /// Rust statements that bring the template's names into scope, and how many blocks they open.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Setup {
+    /// The statements, one per line, indented for the probe's function body.
     pub code: String,
+    /// How many of them open a block that the probe must close.
     pub open: usize,
 }
 
 impl Setup {
+    /// Adds a statement, which opens a block if `opens`.
     fn push(&mut self, line: &str, opens: bool) {
         self.code.push_str("        ");
         self.code.push_str(line);
@@ -47,19 +53,19 @@ impl Setup {
         self.open += usize::from(opens);
     }
 
-    pub fn extend(&mut self, other: Setup) {
+    /// Adds the statements of `other` after these.
+    pub fn extend(&mut self, other: &Self) {
         self.code.push_str(&other.code);
         self.open += other.open;
     }
 }
 
 impl Template<'_> {
-    /// The statements that bring into scope what is visible at `offset`, from the constructs
-    /// that start at or after `from`, outermost first. `None` if one of them cannot be written
-    /// in Rust (an expression with a filter, for one).
+    /// The statements that bring into scope what is visible at `offset`, from the constructs that start at or after `from`, outermost
+    /// first. `None` if one of them cannot be written in Rust (an expression with a filter, for one).
     pub fn setup(&self, offset: usize, from: usize) -> Option<Setup> {
         let mut steps: Vec<(usize, String, bool)> = Vec::new();
-        let tag_at = |start: usize| self.tags.iter().find(|tag| tag.range.start == start);
+        let tag_at = |start: usize| tags::starting_at(self.tags, start);
         for region in Region::walk(self.regions).filter(|region| region.opener.start >= from) {
             let Some(opener) = tag_at(region.opener.start) else {
                 continue;
@@ -74,12 +80,13 @@ impl Template<'_> {
                     let in_at = word_at(self.source, rest.clone(), "in")?;
                     let iter_end = word_at(self.source, in_at + 2..rest.end, "if").unwrap_or(rest.end);
                     let pattern = self.source[rest.start..in_at].trim();
-                    let iterated = self.iter(in_at + 2..iter_end, opener.range.start)?;
+                    let iterated = self.iterated(in_at + 2..iter_end, opener.range.start)?;
                     steps.push((opener.range.start, format!("for {pattern} in {iterated} {{"), true));
                 }
                 RegionKind::If => {
                     let branch = if index == 0 { opener } else { tag_at(region.branches[index - 1].start)? };
                     if let Some((pattern, value)) = if_let(self.source, branch) {
+                        let pattern = self.source[pattern].trim();
                         let value = self.expression(value, branch.range.start)?;
                         steps.push((branch.range.start, format!("if let {pattern} = {value} {{"), true));
                     }
@@ -122,12 +129,11 @@ impl Template<'_> {
         Some(setup)
     }
 
-    /// The `let` statements a macro call makes of its arguments, as the macro's body sees them.
-    /// `arguments` is the text inside the call's parentheses, at `range` in this template, and
-    /// `parameters` the macro's own argument names in order.
+    /// The `let` statements a macro call makes of its arguments, as the macro's body sees them. `arguments` is the text inside the call's
+    /// parentheses, at `range` in this template, and `parameters` the macro's own argument names in order.
     pub fn macro_arguments(&self, range: Range<usize>, parameters: &[String]) -> Option<Setup> {
         let mut setup = Setup::default();
-        for (index, argument) in split_top_level(self.source, range.clone()).into_iter().enumerate() {
+        for (index, argument) in split_top_level(self.source, range.clone(), b',').into_iter().enumerate() {
             let text = self.source[argument.clone()].trim();
             if text.is_empty() {
                 continue;
@@ -138,17 +144,15 @@ impl Template<'_> {
                 None => (parameters.get(index)?.clone(), argument),
             };
             let code = self.expression(value.clone(), range.start)?;
-            let borrow = !self.is_literal(self.source[value].trim());
+            let borrow = !is_literal(self.source[value].trim());
             setup.push(&if borrow { format!("let {name} = &({code});") } else { format!("let {name} = {code};") }, false);
         }
         Some(setup)
     }
 
-    /// An expression in Rust: each name the template does not bind (as seen at `at`) and the
-    /// struct has becomes `self.name`. Askama-only syntax is made Rust of the same length or
-    /// cut: the value before a final filter chain stands for it (`tab.grid|safe` is
-    /// `tab.grid`), and `~` becomes `+`, which keeps the operands' types checked. `None` for
-    /// what cannot be: a filter inside brackets, or `is defined`.
+    /// An expression in Rust: each name the template does not bind (as seen at `at`) and the struct has becomes `self.name`. Askama-only
+    /// syntax is made Rust of the same length or cut: the value before a final filter chain stands for it (`tab.grid|safe` is `tab.grid`),
+    /// and `~` becomes `+`, which keeps the operands' types checked. `None` for what cannot be: a filter inside brackets, or `is defined`.
     pub fn expression(&self, range: Range<usize>, at: usize) -> Option<String> {
         self.mapped_expression(range, at).map(|mapped| mapped.code)
     }
@@ -188,17 +192,16 @@ impl Template<'_> {
                 cursor = position;
                 continue;
             }
-            let starts_word = rest.starts_with(|c: char| c.is_alphabetic() || c == '_') && !source[..position].ends_with(|c: char| c.is_alphanumeric() || c == '_');
-            if !starts_word {
+            if !starts_word(source, position) {
                 match rest.as_bytes()[0] {
                     b'(' | b'[' | b'{' => depth += 1,
                     b')' | b']' | b'}' => depth = depth.saturating_sub(1),
                     _ => {}
                 }
-                position += rest.chars().next().map_or(1, char::len_utf8);
+                position = next_char(source, position);
                 continue;
             }
-            let length = rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len());
+            let length = word_length(rest);
             let word = &rest[..length];
             let before = source[range.start..position].trim_end();
             // `a.name` is a member, but `a..name` is a range up to a variable.
@@ -222,10 +225,10 @@ impl Template<'_> {
     }
 
     /// What a `for` loop iterates, as Askama writes it.
-    fn iter(&self, range: Range<usize>, at: usize) -> Option<String> {
+    fn iterated(&self, range: Range<usize>, at: usize) -> Option<String> {
         let text = self.source[range.clone()].trim();
-        let code = self.expression(range.clone(), at)?;
-        Some(if word_at(self.source, range, "..").is_some() || text.contains("..") {
+        let code = self.expression(range, at)?;
+        Some(if text.contains("..") {
             code
         } else if text.starts_with('[') {
             format!("{code}.iter()")
@@ -238,18 +241,21 @@ impl Template<'_> {
         })
     }
 
+    /// Whether an expression is a literal or a name the template binds, which Askama assigns without a borrow.
     fn is_local_or_literal(&self, text: &str, at: usize) -> bool {
-        self.is_literal(text) || visible_at(self.bindings, at).iter().any(|binding| binding.name == text)
+        is_literal(text) || visible_at(self.bindings, at).iter().any(|binding| binding.name == text)
     }
+}
 
-    fn is_literal(&self, text: &str) -> bool {
-        text.starts_with(|c: char| c.is_ascii_digit() || c == '"' || c == '\'' || c == '-') || matches!(text, "true" | "false")
-    }
+/// Whether an expression is a number, string, char or `bool` literal.
+fn is_literal(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_digit() || c == '"' || c == '\'' || c == '-') || matches!(text, "true" | "false")
 }
 
 /// Rust code made from a template expression, with the way back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mapped {
+    /// The Rust code.
     pub code: String,
     /// Where the code's first character comes from in the template.
     start: usize,
@@ -258,8 +264,7 @@ pub struct Mapped {
 }
 
 impl Mapped {
-    /// The template offset an offset in the code comes from. Inside an inserted `self.` it is
-    /// the name the `self.` was put before.
+    /// The template offset an offset in the code comes from. Inside an inserted `self.` it is the name the `self.` was put before.
     pub fn template_offset(&self, code_offset: usize) -> usize {
         let mut shift = 0;
         for &insert in &self.inserts {
@@ -273,91 +278,22 @@ impl Mapped {
     }
 }
 
+/// What is put before a name the struct has.
 const SELF: &str = "self.";
 
-/// The ranges where a region's branches hold their content: the body, then each later
-/// branch's.
+/// The ranges where a region's branches hold their content: the body, then each later branch's.
 fn segments(region: &Region) -> Vec<Range<usize>> {
     let starts = std::iter::once(region.opener.end).chain(region.branches.iter().map(|branch| branch.end));
     let ends = region.branches.iter().map(|branch| branch.start).chain(std::iter::once(region.closer.as_ref().map_or(region.range.end, |closer| closer.start)));
     starts.zip(ends).map(|(start, end)| start..end).collect()
 }
 
-/// For `if let p = e`, `elif let p = e` or `else if let p = e`: the pattern's text and the
-/// value's range.
-fn if_let<'s>(source: &'s str, tag: &Tag) -> Option<(&'s str, Range<usize>)> {
-    let rest = rest(source, tag);
-    let text = &source[rest.clone()];
-    let let_at = text.find("let ").filter(|&at| text[..at].trim().is_empty() || text[..at].trim() == "if")?;
-    let after_let = rest.start + let_at + 3;
-    let equals = assignment(source, after_let..rest.end)?;
-    Some((source[after_let..equals].trim(), equals + 1..rest.end))
-}
-
-fn rest(source: &str, tag: &Tag) -> Range<usize> {
-    let start = tag.inner.start + tag.keyword(source).len();
-    start.min(tag.inner.end)..tag.inner.end
-}
-
-/// Where `word` appears as a whole word outside brackets and literals.
-fn word_at(source: &str, range: Range<usize>, word: &str) -> Option<usize> {
-    top_level(source, range).find(|&at| {
-        source[at..].starts_with(word)
-            && !source[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_')
-            && !source[at + word.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
-    })
-}
-
-/// Where a single `=` appears outside brackets.
-fn assignment(source: &str, range: Range<usize>) -> Option<usize> {
-    let bytes = source.as_bytes();
-    top_level(source, range).find(|&at| {
-        bytes[at] == b'=' && !matches!(at.checked_sub(1).map(|before| bytes[before]), Some(b'=' | b'!' | b'<' | b'>')) && !matches!(bytes.get(at + 1), Some(b'=' | b'>'))
-    })
-}
-
-fn split_top_level(source: &str, range: Range<usize>) -> Vec<Range<usize>> {
-    let mut parts = Vec::new();
-    let mut start = range.start;
-    for at in top_level(source, range.clone()) {
-        if source.as_bytes()[at] == b',' {
-            parts.push(start..at);
-            start = at + 1;
-        }
-    }
-    parts.push(start..range.end);
-    parts
-}
-
-/// The byte positions in `range` outside brackets and literals.
-fn top_level(source: &str, range: Range<usize>) -> impl Iterator<Item = usize> + '_ {
-    let mut depth = 0usize;
-    let mut at = range.start;
-    std::iter::from_fn(move || {
-        while at < range.end {
-            if let Some(end) = literal_end(source, at) {
-                at = end;
-                continue;
-            }
-            let here = at;
-            let byte = source.as_bytes()[here];
-            at += source[here..].chars().next().map_or(1, char::len_utf8);
-            match byte {
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-                _ if depth == 0 => return Some(here),
-                _ => {}
-            }
-        }
-        None
-    })
-}
-
 /// The text inside the parentheses of a `{% call %}` tag, and the range of it.
 pub fn call_arguments(source: &str, tag: &Tag) -> Option<Range<usize>> {
-    let rest = rest(source, tag);
-    let open = rest.start + source[rest.clone()].find('(')?;
-    let close = rest.start + source[rest].rfind(')')?;
+    // The parentheses after the macro's name, not those of the caller parameters before it (`{% call(user) m::row(x) %}`).
+    let name_start = call_parts(source, tag).1;
+    let open = name_start + source[name_start..tag.inner.end].find('(')?;
+    let close = name_start + source[name_start..tag.inner.end].rfind(')')?;
     (open < close).then_some(open + 1..close)
 }
 
@@ -450,6 +386,13 @@ mod tests {
         assert_eq!(&source[mapped.template_offset(total)..mapped.template_offset(total + 5)], "total");
         // Inside an inserted `self.`, the name it was put before.
         assert_eq!(mapped.template_offset(1), source.find("order").unwrap());
+    }
+
+    #[test]
+    fn finds_a_calls_arguments_after_its_caller_parameters() {
+        let source = "{% call(user) m::list(order.users, 3) %}{% endcall %}";
+        let tags = scan(source, &default_syntax());
+        assert_eq!(call_arguments(source, &tags[0]).map(|range| &source[range]), Some("order.users, 3"));
     }
 
     #[test]

@@ -1,13 +1,14 @@
-//! Navigation between templates: the template paths in `extends`, `include` and `import`,
-//! blocks and the blocks they override, macros and the calls that use them.
+//! Navigation between templates: the template paths in `extends`, `include` and `import`, blocks and the blocks they override, macros and
+//! the calls that use them.
 //!
-//! Other templates are read when a question needs them, not indexed ahead of time. A crate's
-//! templates are few and small, so reading them per request is quick, and nothing can go
-//! stale. The caller supplies the reader, so open documents are read with their unsaved text.
+//! Other templates are read when a question needs them, not indexed ahead of time. A crate's templates are few and small, so reading them
+//! per request is quick, and nothing can go stale. The caller supplies the reader, so open documents are read with their unsaved text.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::config::Config;
 use crate::rust::TemplateStruct;
@@ -22,41 +23,51 @@ const MAX_PARENTS: usize = 32;
 /// How many templates the search for a struct's templates visits at most.
 const MAX_REACHED: usize = 256;
 
-/// Block tags whose words are names of their own (a block, a macro, a template), not
-/// variables.
+/// Block tags whose words are names of their own (a block, a macro, a template), not variables.
 pub const NOT_EXPRESSIONS: &[&str] = &["block", "endblock", "macro", "endmacro", "extends", "include", "import", "call", "endcall", "filter", "raw", "endraw"];
 
 /// A place in a template.
 #[derive(Debug, Clone)]
 pub struct Location {
+    /// The template's file.
     pub path: PathBuf,
+    /// The template's text, as it was read.
     pub text: Arc<str>,
+    /// The byte range in `text`.
     pub range: Range<usize>,
 }
 
 /// A name in a tag, such as a block's or a macro's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ident {
+    /// The name.
     pub name: String,
+    /// Its byte range in the template.
     pub range: Range<usize>,
 }
 
 impl Ident {
-    fn contains(&self, offset: usize) -> bool {
+    /// Whether `offset` is in the name or at either end of it.
+    const fn contains(&self, offset: usize) -> bool {
         self.range.start <= offset && offset <= self.range.end
     }
 }
 
+/// The tag a template path is named in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
+    /// `{% extends "..." %}`.
     Extends,
+    /// `{% include "..." %}`.
     Include,
+    /// `{% import "..." as scope %}`.
     Import,
 }
 
 /// A template named by `extends`, `include` or `import`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplatePath {
+    /// The tag that names it.
     pub kind: PathKind,
     /// The name between the quotes, and its range.
     pub name: Ident,
@@ -67,23 +78,31 @@ pub struct TemplatePath {
 /// A `{% call %}` tag's macro, with its scope when it has one (`m::money_cell`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroCall {
+    /// The import scope, `m` in `m::money_cell`.
     pub scope: Option<Ident>,
+    /// The macro's name.
     pub name: Ident,
 }
 
+/// What a workspace symbol is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
+    /// A `{% block %}`.
     Block,
+    /// A `{% macro %}`.
     Macro,
 }
 
 /// A block or macro anywhere in a crate's templates.
 #[derive(Debug, Clone)]
 pub struct Symbol {
+    /// The block's or macro's name.
     pub name: String,
+    /// Whether it is a block or a macro.
     pub kind: SymbolKind,
     /// The template's name, such as `partials/header.html`.
     pub template: String,
+    /// Where its name is written.
     pub location: Location,
 }
 
@@ -101,7 +120,8 @@ pub fn template_paths(source: &str, tags: &[Tag]) -> Vec<TemplatePath> {
             let scope = (kind == PathKind::Import)
                 .then(|| {
                     let after = skip_whitespace(source, name.range.end + 1);
-                    source[after..].starts_with("as").then(|| identifier(source, after + 2, tag.inner.end))?
+                    let is_as = source.get(after..).is_some_and(|rest| rest.starts_with("as") && !rest[2..].starts_with(|c: char| c.is_alphanumeric() || c == '_'));
+                    is_as.then(|| identifier(source, after + 2, tag.inner.end))?
                 })
                 .flatten();
             Some(TemplatePath { kind, name, scope })
@@ -124,9 +144,11 @@ pub fn macro_calls(source: &str, tags: &[Tag]) -> Vec<MacroCall> {
     block_tags(source, tags)
         .filter(|&(_, keyword)| keyword == "call")
         .filter_map(|(tag, _)| {
-            let first = identifier(source, rest_start(source, tag), tag.inner.end)?;
+            // After the caller parameters, if there are any: `{% call(user) m::row(x) %}`.
+            let first = identifier(source, crate::text::call_parts(source, tag).1, tag.inner.end)?;
             let after = skip_whitespace(source, first.range.end);
-            if source[after..tag.inner.end].starts_with("::") {
+            // `{% call name %}` has nothing after the name, and `after` is then past the end.
+            if source.get(after..tag.inner.end).is_some_and(|rest| rest.starts_with("::")) {
                 let name = identifier(source, after + 2, tag.inner.end)?;
                 Some(MacroCall { scope: Some(first), name })
             } else {
@@ -136,11 +158,13 @@ pub fn macro_calls(source: &str, tags: &[Tag]) -> Vec<MacroCall> {
         .collect()
 }
 
-/// The variable named at `offset`: an identifier in an expression that is not a field or
-/// method of something (`.name`), a path segment (`a::b`), a filter (`|name`), a tag keyword,
-/// or inside a literal.
+/// The variable named at `offset`: an identifier in an expression that is not a field or method of something (`.name`), a path segment
+/// (`a::b`), a filter (`|name`), a tag keyword, or inside a literal. `None` also for an offset that is not on a character boundary.
 pub fn variable_at(source: &str, tags: &[Tag], offset: usize) -> Option<Ident> {
-    let tag = tags.iter().find(|tag| matches!(tag.kind, TagKind::Expr | TagKind::Block) && tag.inner.start <= offset && offset <= tag.inner.end)?;
+    if !source.is_char_boundary(offset) {
+        return None;
+    }
+    let tag = tags::containing(tags, offset).filter(|tag| matches!(tag.kind, TagKind::Expr | TagKind::Block) && tag.inner.start <= offset && offset <= tag.inner.end)?;
     if tag.kind == TagKind::Block && NOT_EXPRESSIONS.contains(&tag.keyword(source)) {
         return None;
     }
@@ -155,7 +179,9 @@ pub fn variable_at(source: &str, tags: &[Tag], offset: usize) -> Option<Ident> {
         return None;
     }
     let before = source[tag.inner.start..start].trim_end();
-    if before.ends_with(['.', ':', '|']) || source[end..tag.inner.end].trim_start().starts_with("::") {
+    // A `.` before the name makes it a member, but `..` makes it the end of a range (`0..n`).
+    let member = before.ends_with('.') && !before.ends_with("..");
+    if member || before.ends_with([':', '|']) || source[end..tag.inner.end].trim_start().starts_with("::") {
         return None;
     }
     let mut at = tag.inner.start;
@@ -163,12 +189,13 @@ pub fn variable_at(source: &str, tags: &[Tag], offset: usize) -> Option<Ident> {
         match literal_end(source, at) {
             Some(literal) if literal > start => return None,
             Some(literal) => at = literal,
-            None => at += source[at..].chars().next().map_or(1, char::len_utf8),
+            None => at = tags::next_char(source, at),
         }
     }
     Some(Ident { name: name.to_owned(), range: start..end })
 }
 
+/// The names that the block tags with `keyword` define, such as every `{% block name %}`.
 fn named(source: &str, tags: &[Tag], keyword: &str) -> Vec<Ident> {
     block_tags(source, tags)
         .filter(|&(_, found)| found == keyword)
@@ -176,6 +203,7 @@ fn named(source: &str, tags: &[Tag], keyword: &str) -> Vec<Ident> {
         .collect()
 }
 
+/// The block tags (`{% %}`) among `tags`, each with its keyword.
 fn block_tags<'t, 's>(source: &'s str, tags: &'t [Tag]) -> impl Iterator<Item = (&'t Tag, &'s str)> {
     tags.iter().filter(|tag| tag.kind == TagKind::Block).map(move |tag| (tag, tag.keyword(source)))
 }
@@ -185,6 +213,7 @@ fn rest_start(source: &str, tag: &Tag) -> usize {
     skip_whitespace(source, tag.inner.start + tag.keyword(source).len())
 }
 
+/// The offset of the first character at or after `from` that is not whitespace.
 fn skip_whitespace(source: &str, from: usize) -> usize {
     let from = from.min(source.len());
     from + (source[from..].len() - source[from..].trim_start().len())
@@ -210,35 +239,177 @@ fn quoted(source: &str, from: usize, limit: usize) -> Option<Ident> {
     Some(Ident { name: content[..length].to_owned(), range: start..start + length })
 }
 
+/// What a crate's templates are on disk: their texts, canonical paths, where Askama finds each template name, and the templates each one
+/// reaches. Every question that spans templates needs these, and working them out means reading files and asking the file system.
+///
+/// A project makes a cache of its own, which lives for one request. A caller that watches the crate's template directories can keep one
+/// across requests instead (`Project::with_cache`) and `clear` it whenever a file there changes; nothing in it is otherwise checked against
+/// the disk. Open documents are not held here: their text comes from the reader, and what is worked out from a text is kept only while the
+/// text is the same.
+#[derive(Debug, Default)]
+pub struct FileCache {
+    /// Texts read from disk, `None` for a file that could not be read.
+    texts: HashMap<PathBuf, Option<Arc<str>>>,
+    /// The canonical form of each path, `None` for one that does not exist.
+    canonical: HashMap<PathBuf, Option<PathBuf>>,
+    /// Where Askama finds each name, by the directory of the template that names it (`None` for a struct's template) and the name.
+    found: HashMap<(Option<PathBuf>, String), Option<PathBuf>>,
+    /// The templates each template names in `extends` and `include`, found, with the text they were worked out from.
+    reaches: HashMap<PathBuf, (Arc<str>, Arc<[PathBuf]>)>,
+    /// Every file in the template directories (`Config::template_files`), once listed.
+    files: Option<Arc<[PathBuf]>>,
+}
+
+impl FileCache {
+    /// Forgets everything, after a change in the template directories.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A file's text from disk, read once (see `project::read_text`).
+    pub fn text(&mut self, path: &Path) -> Option<Arc<str>> {
+        self.texts.entry(path.to_path_buf()).or_insert_with(|| crate::project::read_text(path).map(Arc::from)).clone()
+    }
+}
+
+/// A project's file cache: its own, for one request, or one the caller keeps.
+enum CacheRef<'a> {
+    /// Made for this project.
+    Own(Box<Mutex<FileCache>>),
+    /// Kept by the caller across requests.
+    Shared(&'a Mutex<FileCache>),
+}
+
 /// A crate's templates, for questions that span files.
+///
+/// A project lives for one request. It remembers the texts it reads, so the answers within one request agree with each other, and keeps
+/// what it works out from the file system in a `FileCache`, so a template several questions need, such as a shared base, is read and
+/// scanned once.
 pub struct Project<'a> {
+    /// The crate's Askama configuration.
     config: &'a Config,
+    /// Reads a template's text.
     read: &'a Reader<'a>,
+    /// The texts read so far in this request, `None` for a file that could not be read.
+    texts: RefCell<HashMap<PathBuf, Option<Arc<str>>>>,
+    /// What is known of the files on disk.
+    cache: CacheRef<'a>,
 }
 
 impl<'a> Project<'a> {
+    /// The templates of the crate `config` describes, read with `read`, with a file cache for this request only.
     pub fn new(config: &'a Config, read: &'a Reader<'a>) -> Self {
-        Self { config, read }
+        Self { config, read, texts: RefCell::default(), cache: CacheRef::Own(Box::default()) }
     }
 
+    /// Like `new`, keeping what is learned of the files in `cache`, which the caller keeps across requests and clears when a template file
+    /// changes.
+    pub fn with_cache(config: &'a Config, read: &'a Reader<'a>, cache: &'a Mutex<FileCache>) -> Self {
+        Self { config, read, texts: RefCell::default(), cache: CacheRef::Shared(cache) }
+    }
+
+    /// The file cache, locked. It is never held while the reader runs or while another lock is taken.
+    fn cache(&self) -> MutexGuard<'_, FileCache> {
+        match &self.cache {
+            CacheRef::Own(cache) => cache.lock(),
+            CacheRef::Shared(cache) => cache.lock(),
+        }
+        .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Every file in the template directories, listed once per cache.
+    fn template_files(&self) -> Arc<[PathBuf]> {
+        if let Some(files) = &self.cache().files {
+            return Arc::clone(files);
+        }
+        let files: Arc<[PathBuf]> = self.config.template_files().into();
+        self.cache().files = Some(Arc::clone(&files));
+        files
+    }
+
+    /// The file Askama finds for `name`, beside `from` first (see `Config::find_template`), asking the file system once per cache.
+    fn find(&self, name: &str, from: Option<&Path>) -> Option<PathBuf> {
+        let key = (from.and_then(Path::parent).map(Path::to_path_buf), name.to_owned());
+        if let Some(found) = self.cache().found.get(&key) {
+            return found.clone();
+        }
+        let found = self.config.find_template(name, from);
+        self.cache().found.insert(key, found.clone());
+        found
+    }
+
+    /// The templates `file` names in `extends` and `include` that Askama would find, worked out once per text. `import` does not count:
+    /// macros do not see the struct's fields.
+    fn reaches(&self, file: &Path) -> Arc<[PathBuf]> {
+        let Some(text) = self.read(file) else {
+            return Arc::from([]);
+        };
+        if let Some((from, found)) = self.cache().reaches.get(file)
+            && Arc::ptr_eq(from, &text)
+        {
+            return Arc::clone(found);
+        }
+        let found: Arc<[PathBuf]> = template_paths(&text, &self.tags(&text))
+            .into_iter()
+            .filter(|path| path.kind != PathKind::Import)
+            .filter_map(|path| self.find(&path.name.name, Some(file)))
+            .collect::<Vec<_>>()
+            .into();
+        self.cache().reaches.insert(file.to_path_buf(), (text, Arc::clone(&found)));
+        found
+    }
+
+    /// A template's tags, scanned with the crate's default syntax.
     fn tags(&self, text: &str) -> Vec<Tag> {
         tags::scan(text, &self.config.default_syntax())
     }
 
-    /// Each template path in a template, with the file it refers to, or `None` when Askama
-    /// would not find it.
+    /// A template's text, read once per project.
+    fn read(&self, path: &Path) -> Option<Arc<str>> {
+        if let Some(text) = self.texts.borrow().get(path) {
+            return text.clone();
+        }
+        let text = (self.read)(path);
+        self.texts.borrow_mut().insert(path.to_path_buf(), text.clone());
+        text
+    }
+
+    /// A path's canonical form, worked out once per cache.
+    fn canonical(&self, path: &Path) -> Option<PathBuf> {
+        if let Some(canonical) = self.cache().canonical.get(path) {
+            return canonical.clone();
+        }
+        let canonical = path.canonicalize().ok();
+        self.cache().canonical.insert(path.to_path_buf(), canonical.clone());
+        canonical
+    }
+
+    /// Whether two paths name the same file, as `same_file` decides, with the canonical paths remembered.
+    fn same_file(&self, a: &Path, b: &Path) -> bool {
+        match (self.canonical(a), self.canonical(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => a == b,
+        }
+    }
+
+    /// The key a path is compared by in a set of visited templates.
+    fn key(&self, path: &Path) -> PathBuf {
+        self.canonical(path).unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Each template path in a template, with the file it refers to, or `None` when Askama would not find it.
     pub fn resolved_paths(&self, file: &Path, text: &str) -> Vec<(TemplatePath, Option<PathBuf>)> {
         template_paths(text, &self.tags(text))
             .into_iter()
             .map(|path| {
-                let target = self.config.find_template(&path.name.name, Some(file));
+                let target = self.find(&path.name.name, Some(file));
                 (path, target)
             })
             .collect()
     }
 
-    /// Where the name at `offset` is defined: the file of a template path, the parent's
-    /// block that a block overrides, a called macro, or the `import` that gives a scope.
+    /// Where the name at `offset` is defined: the file of a template path, the parent's block that a block overrides, a called macro, or
+    /// the `import` that gives a scope.
     pub fn definition(&self, file: &Path, text: &Arc<str>, offset: usize) -> Option<Location> {
         let tags = self.tags(text);
         let tag = tags.iter().find(|tag| tag.kind == TagKind::Block && tag.range.start <= offset && offset <= tag.range.end)?;
@@ -248,8 +419,8 @@ impl<'a> Project<'a> {
                 if !path.name.contains(offset) {
                     return None;
                 }
-                let target = self.config.find_template(&path.name.name, Some(file))?;
-                let target_text = (self.read)(&target)?;
+                let target = self.find(&path.name.name, Some(file))?;
+                let target_text = self.read(&target)?;
                 Some(Location { path: target, text: target_text, range: 0..0 })
             }
             "block" => {
@@ -265,7 +436,7 @@ impl<'a> Project<'a> {
             "call" => {
                 let call = macro_calls(text, std::slice::from_ref(tag)).into_iter().next()?;
                 if let Some(scope) = call.scope.as_ref().filter(|scope| scope.contains(offset)) {
-                    let import = self.import(text, &tags, &scope.name)?;
+                    let import = import(text, &tags, &scope.name)?;
                     let scope = import.scope?;
                     return Some(Location { path: file.to_path_buf(), text: Arc::clone(text), range: scope.range });
                 }
@@ -283,16 +454,15 @@ impl<'a> Project<'a> {
         blocks(text, &self.tags(text)).into_iter().find(|block| block.contains(offset))
     }
 
-    /// The blocks in other templates that override `file`'s block `name`: those in every
-    /// template that extends `file`, directly or through other templates.
+    /// The blocks in other templates that override `file`'s block `name`: those in every template that extends `file`, directly or through
+    /// other templates.
     pub fn overrides(&self, file: &Path, name: &str) -> Vec<Location> {
-        self.config
-            .template_files()
-            .into_iter()
-            .filter(|other| !same_file(other, file))
+        self.template_files()
+            .iter()
+            .filter(|other| !self.same_file(other, file))
             .filter_map(|other| {
-                let text = (self.read)(&other)?;
-                let extends_file = self.parents(&other, &text).iter().any(|(parent, _)| same_file(parent, file));
+                let text = self.read(other)?;
+                let extends_file = self.parents(other, &text).iter().any(|(parent, _)| self.same_file(parent, file));
                 extends_file.then_some((other, text))
             })
             .flat_map(|(other, text)| {
@@ -308,11 +478,11 @@ impl<'a> Project<'a> {
     /// Every block and macro in the crate's templates.
     pub fn symbols(&self) -> Vec<Symbol> {
         let mut symbols = Vec::new();
-        for file in self.config.template_files() {
-            let Some(text) = (self.read)(&file) else {
+        for file in self.template_files().iter() {
+            let Some(text) = self.read(file) else {
                 continue;
             };
-            let template = self.config.template_name(&file).unwrap_or_else(|| file.display().to_string());
+            let template = self.config.template_name(file).unwrap_or_else(|| file.display().to_string());
             let tags = self.tags(&text);
             let found = blocks(&text, &tags)
                 .into_iter()
@@ -330,66 +500,61 @@ impl<'a> Project<'a> {
         symbols
     }
 
-    /// The template structs whose template is `file` or reaches it through `extends` or
-    /// `include`, so their fields are in scope in it.
+    /// The template structs whose template is `file` or reaches it through `extends` or `include`, so their fields are in scope in it.
     pub fn structs_for<'s>(&self, file: &Path, structs: &'s [TemplateStruct]) -> Vec<&'s TemplateStruct> {
+        let file = self.key(file);
+        // Structs often share a template, and each template is followed once.
+        let mut reaches: HashMap<&str, bool> = HashMap::new();
         structs
             .iter()
             .filter(|template_struct| {
-                let Some(start) = self.config.find_template(&template_struct.template, None) else {
-                    return false;
-                };
-                self.reached_from(start).iter().any(|reached| same_file(reached, file))
+                *reaches.entry(template_struct.template.as_str()).or_insert_with(|| {
+                    self.find(&template_struct.template, None).is_some_and(|start| self.reached_from(start).contains(&file))
+                })
             })
             .collect()
     }
 
-    /// Whether `file` is the template of one of `structs` or one it extends, so the struct's
-    /// fields and the template's own bindings are all the names it can use. A template
-    /// reached through `include` also sees the names bound where it is included.
+    /// Whether `file` is the template of one of `structs` or one it extends, so the struct's fields and the template's own bindings are all
+    /// the names it can use. A template reached through `include` also sees the names bound where it is included.
     pub fn sees_only_struct_names(&self, file: &Path, structs: &[&TemplateStruct]) -> bool {
         structs.iter().any(|template_struct| {
-            let Some(start) = self.config.find_template(&template_struct.template, None) else {
+            let Some(start) = self.find(&template_struct.template, None) else {
                 return false;
             };
-            if same_file(&start, file) {
+            if self.same_file(&start, file) {
                 return true;
             }
-            let Some(text) = (self.read)(&start) else {
+            let Some(text) = self.read(&start) else {
                 return false;
             };
-            self.parents(&start, &text).iter().any(|(parent, _)| same_file(parent, file))
+            self.parents(&start, &text).iter().any(|(parent, _)| self.same_file(parent, file))
         })
     }
 
-    /// `start` and every template it reaches through `extends` and `include`.
-    fn reached_from(&self, start: PathBuf) -> Vec<PathBuf> {
-        let mut reached = vec![start];
-        let mut next = 0;
-        while next < reached.len() && reached.len() < MAX_REACHED {
-            let file = reached[next].clone();
-            next += 1;
-            let Some(text) = (self.read)(&file) else {
-                continue;
-            };
-            for (path, target) in self.resolved_paths(&file, &text) {
-                if let Some(target) = target
-                    && path.kind != PathKind::Import
-                    && !reached.iter().any(|seen| same_file(seen, &target))
-                {
-                    reached.push(target);
+    /// `start` and every template it reaches through `extends` and `include`, by canonical path (see `key`).
+    fn reached_from(&self, start: PathBuf) -> HashSet<PathBuf> {
+        let mut reached = HashSet::from([self.key(&start)]);
+        let mut queue = vec![start];
+        while let Some(file) = queue.pop() {
+            if reached.len() >= MAX_REACHED {
+                break;
+            }
+            for target in self.reaches(&file).iter() {
+                if reached.insert(self.key(target)) {
+                    queue.push(target.clone());
                 }
             }
         }
         reached
     }
 
-    /// Every `{% call %}` of the macro `name` defined in `macro_file`, in any template: the
-    /// calling template, its text and the call tag's range.
+    /// Every `{% call %}` of the macro `name` defined in `macro_file`, in any template: the calling template, its text and the call tag's
+    /// range.
     pub fn macro_call_sites(&self, macro_file: &Path, name: &str) -> Vec<(PathBuf, Arc<str>, Range<usize>)> {
         let mut sites = Vec::new();
-        for file in self.config.template_files() {
-            let Some(text) = (self.read)(&file) else {
+        for file in self.template_files().iter() {
+            let Some(text) = self.read(file) else {
                 continue;
             };
             let tags = self.tags(&text);
@@ -398,10 +563,10 @@ impl<'a> Project<'a> {
                     continue;
                 };
                 let target = match &call.scope {
-                    Some(scope) => self.import(&text, &tags, &scope.name).and_then(|import| self.config.find_template(&import.name.name, Some(&file))),
+                    Some(scope) => import(&text, &tags, &scope.name).and_then(|import| self.find(&import.name.name, Some(file))),
                     None => Some(file.clone()),
                 };
-                if target.is_some_and(|target| same_file(&target, macro_file)) {
+                if target.is_some_and(|target| self.same_file(&target, macro_file)) {
                     sites.push((file.clone(), Arc::clone(&text), tag.range.clone()));
                 }
             }
@@ -412,41 +577,36 @@ impl<'a> Project<'a> {
     /// The templates `file` extends, nearest first, with their text.
     fn parents(&self, file: &Path, text: &str) -> Vec<(PathBuf, Arc<str>)> {
         let mut chain: Vec<(PathBuf, Arc<str>)> = Vec::new();
-        let mut current = (file.to_path_buf(), Arc::<str>::from(text));
+        let mut current_file = file.to_path_buf();
+        let mut current_extends = extends(text, &self.tags(text));
         while chain.len() < MAX_PARENTS {
-            let tags = self.tags(&current.1);
-            let Some(extends) = template_paths(&current.1, &tags).into_iter().find(|path| path.kind == PathKind::Extends) else {
+            let Some(name) = current_extends else {
                 break;
             };
-            let Some(parent) = self.config.find_template(&extends.name.name, Some(&current.0)) else {
+            let Some(parent) = self.find(&name, Some(&current_file)) else {
                 break;
             };
-            if same_file(&parent, file) || chain.iter().any(|(seen, _)| same_file(seen, &parent)) {
+            if self.same_file(&parent, file) || chain.iter().any(|(seen, _)| self.same_file(seen, &parent)) {
                 break;
             }
-            let Some(parent_text) = (self.read)(&parent) else {
+            let Some(parent_text) = self.read(&parent) else {
                 break;
             };
-            chain.push((parent.clone(), Arc::clone(&parent_text)));
-            current = (parent, parent_text);
+            current_extends = extends(&parent_text, &self.tags(&parent_text));
+            chain.push((parent.clone(), parent_text));
+            current_file = parent;
         }
         chain
     }
 
-    fn import(&self, text: &str, tags: &[Tag], scope: &str) -> Option<TemplatePath> {
-        template_paths(text, tags)
-            .into_iter()
-            .find(|path| path.kind == PathKind::Import && path.scope.as_ref().is_some_and(|found| found.name == scope))
-    }
-
-    /// A called macro's definition: in the imported template for a scoped call, otherwise in
-    /// this template or, failing that, a template it extends.
+    /// A called macro's definition: in the imported template for a scoped call, otherwise in this template or, failing that, a template it
+    /// extends.
     fn macro_definition(&self, file: &Path, text: &Arc<str>, tags: &[Tag], call: &MacroCall) -> Option<Location> {
         let candidates: Vec<(PathBuf, Arc<str>)> = match &call.scope {
             Some(scope) => {
-                let import = self.import(text, tags, &scope.name)?;
-                let target = self.config.find_template(&import.name.name, Some(file))?;
-                let target_text = (self.read)(&target)?;
+                let import = import(text, tags, &scope.name)?;
+                let target = self.find(&import.name.name, Some(file))?;
+                let target_text = self.read(&target)?;
                 vec![(target, target_text)]
             }
             None => std::iter::once((file.to_path_buf(), Arc::clone(text))).chain(self.parents(file, text)).collect(),
@@ -456,6 +616,18 @@ impl<'a> Project<'a> {
             Some(Location { path, text: candidate, range: found.range })
         })
     }
+}
+
+/// The template a template's `{% extends %}` names, if it has one.
+fn extends(text: &str, tags: &[Tag]) -> Option<String> {
+    template_paths(text, tags).into_iter().find(|path| path.kind == PathKind::Extends).map(|path| path.name.name)
+}
+
+/// The `{% import %}` that gives the scope `scope`.
+fn import(text: &str, tags: &[Tag], scope: &str) -> Option<TemplatePath> {
+    template_paths(text, tags)
+        .into_iter()
+        .find(|path| path.kind == PathKind::Import && path.scope.as_ref().is_some_and(|found| found.name == scope))
 }
 
 /// Whether two paths name the same file, comparing canonical paths when both exist.
@@ -641,7 +813,7 @@ mod tests {
                 name: template.to_string(),
                 template: template.to_string(),
                 template_range: 0..0,
-                file: dir.path("src/main.rs"),
+                file: dir.path("src/main.rs").into(),
                 range: 0..0,
                 members: Vec::new(),
                 impl_header: String::new(),
@@ -658,7 +830,72 @@ mod tests {
         assert_eq!(names("templates/page.html"), ["page.html", "deep/leaf.html"]);
         // Imported macros do not see the struct's fields.
         assert_eq!(names("templates/macros.html"), ["macros.html"]);
-        assert!(names("templates/local.html").is_empty());
+        assert_eq!(names("templates/local.html"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn reads_the_macro_after_caller_parameters() {
+        let source = "{% call(user) m::list(users) %}{% endcall %}{% call (row) table() %}{% endcall %}";
+        let calls = macro_calls(source, &tags::scan(source, &default_syntax()));
+        let names: Vec<(Option<&str>, &str)> = calls.iter().map(|call| (call.scope.as_ref().map(|scope| scope.name.as_str()), call.name.name.as_str())).collect();
+        assert_eq!(names, [(Some("m"), "list"), (None, "table")]);
+    }
+
+    #[test]
+    fn reads_a_call_with_no_arguments_yet() {
+        // While typing, `{% call row %}` has no `(`, which once sliced past the tag's end.
+        let source = "{% call row %}{% call m::cell %}";
+        let calls = macro_calls(source, &tags::scan(source, &default_syntax()));
+        let names: Vec<(Option<&str>, &str)> = calls.iter().map(|call| (call.scope.as_ref().map(|scope| scope.name.as_str()), call.name.name.as_str())).collect();
+        assert_eq!(names, [(None, "row"), (Some("m"), "cell")]);
+    }
+
+    #[test]
+    fn finds_the_end_of_a_range_as_a_variable() {
+        let source = "{% for i in 0..n %}{{ i }}{% endfor %}{{ a.b }}";
+        let tags = tags::scan(source, &default_syntax());
+        assert_eq!(variable_at(source, &tags, source.find("n %").unwrap()).map(|ident| ident.name), Some("n".to_owned()));
+        assert_eq!(variable_at(source, &tags, source.find("b }").unwrap()), None);
+    }
+
+    #[test]
+    fn needs_a_whole_word_for_an_import_scope() {
+        let source = "{% import \"m.html\" asm %}";
+        let paths = template_paths(source, &tags::scan(source, &default_syntax()));
+        assert_eq!(paths[0].scope, None);
+    }
+
+    #[test]
+    fn keeps_what_a_shared_cache_learns_until_it_is_cleared() {
+        let dir = site();
+        let config = Config::default_for(&dir.path(""));
+        let cache = Mutex::new(FileCache::default());
+        let structs = vec![TemplateStruct {
+            name: "Leaf".to_owned(),
+            template: "deep/leaf.html".to_owned(),
+            template_range: 0..0,
+            file: dir.path("src/main.rs").into(),
+            range: 0..0,
+            members: Vec::new(),
+            impl_header: String::new(),
+            item_end: 0,
+        }];
+        let reaches_base = |read: &Reader<'_>| !Project::with_cache(&config, read, &cache).structs_for(&dir.path("templates/base.html"), &structs).is_empty();
+        let from_disk = |path: &Path| cache_text(&cache, path);
+        assert!(reaches_base(&from_disk));
+        // `page.html` stops extending `base.html` on disk, unreported: the cache still has the old text and what came of it.
+        dir.write("templates/page.html", "{% block content %}{% endblock %}");
+        assert!(reaches_base(&from_disk));
+        cache.lock().unwrap().clear();
+        assert!(!reaches_base(&from_disk));
+        // An open document's text comes from the reader, and a new text is read anew even with the cache kept.
+        let edited = |path: &Path| if path.ends_with("page.html") { Some(Arc::from("{% extends \"base.html\" %}")) } else { cache_text(&cache, path) };
+        assert!(reaches_base(&edited));
+    }
+
+    /// A file's text through the cache, as a server's reader takes the text of a file that is not open.
+    fn cache_text(cache: &Mutex<FileCache>, path: &Path) -> Option<Arc<str>> {
+        cache.lock().unwrap().text(path)
     }
 
     #[test]

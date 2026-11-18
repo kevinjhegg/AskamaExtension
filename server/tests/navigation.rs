@@ -1,5 +1,5 @@
-//! End-to-end tests of navigation between templates: links, definitions, references,
-//! implementations, workspace symbols and missing-template warnings.
+//! End-to-end tests of navigation between templates: links, definitions, references, implementations, workspace symbols and
+//! missing-template warnings.
 
 mod common;
 
@@ -39,7 +39,7 @@ fn range(start: (u32, u32), end: (u32, u32)) -> Value {
 
 #[test]
 fn warns_about_a_missing_template() {
-    let (_krate, mut server, uri) = site();
+    let (_krate, server, uri) = site();
     let diagnostics = server.diagnostics_for(&uri);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0]["severity"], 2);

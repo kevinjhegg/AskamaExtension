@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Writes every string literal in a crate's test code, cut at format placeholders, as a JSON list:
-the texts askama_layout.py --protect keeps whole. Reads tests/**/*.rs and each src file from its
-first #[cfg(test)].
+"""Writes every string literal in a crate's test code, cut at format placeholders, as a JSON list: the texts askama_layout.py --protect
+keeps whole. Reads tests/**/*.rs and each src file from its first #[cfg(test)].
 
 Usage: test_fragments.py CRATE_DIR OUT.json
 """

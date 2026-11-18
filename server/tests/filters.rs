@@ -1,5 +1,5 @@
-//! End-to-end tests of filters and tag keywords: completion, hover, going to a custom
-//! filter's Rust function, and the unknown-filter warning.
+//! End-to-end tests of filters and tag keywords: completion, hover, going to a custom filter's Rust function, and the unknown-filter
+//! warning.
 
 mod common;
 
@@ -44,7 +44,7 @@ fn labels(items: &Value) -> Vec<(String, String)> {
 
 #[test]
 fn warns_about_an_unknown_filter_only() {
-    let (_krate, mut server, uri) = site();
+    let (_krate, server, uri) = site();
     let diagnostics = server.diagnostics_for(&uri);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0]["severity"], 2);

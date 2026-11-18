@@ -1,5 +1,5 @@
-//! End-to-end tests: start the `askama-lsp` binary, talk LSP to it over stdin and stdout as
-//! VS Code does, and check the diagnostics it publishes.
+//! End-to-end tests: start the `askama-lsp` binary, talk LSP to it over stdin and stdout as VS Code does, and check the diagnostics it
+//! publishes.
 
 mod common;
 

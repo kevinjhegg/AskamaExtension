@@ -23,4 +23,3 @@ That writes `askama-vscode-<platform>-<version>.vsix` here. Install it in VS Cod
 ## Docs
 
 - `docs/design.md`: the architecture and how it works today.
-- `docs/implementation-plan.md`: the steps, each ending with something to try in VS Code.

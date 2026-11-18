@@ -1,5 +1,4 @@
-//! What can be completed at the cursor: a filter after `|` (or after `{% filter`), or a tag
-//! keyword at the start of a `{% %}` tag.
+//! What can be completed at the cursor: a filter after `|` (or after `{% filter`), or a tag keyword at the start of a `{% %}` tag.
 
 use std::ops::Range;
 
@@ -15,18 +14,35 @@ pub const KEYWORDS: &[&str] = &[
     "if", "import", "include", "let", "macro", "match", "raw", "set", "when",
 ];
 
+/// What kind of name the cursor is at, with the text a chosen item replaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Completion {
-    /// A filter name, replacing `replace`.
-    Filter { replace: Range<usize> },
-    /// A tag keyword, replacing `replace`. `closer` is the tag that closes the innermost
-    /// region still open at the cursor, offered first.
-    Keyword { replace: Range<usize>, closer: Option<&'static str> },
-    /// A variable, bound in the template or from its struct, replacing `replace`.
-    Variable { replace: Range<usize> },
-    /// A member of `object`, the dotted path before the cursor (`loop`, `order.customer`),
-    /// replacing `replace`.
-    Member { object: String, replace: Range<usize> },
+    /// A filter name.
+    Filter {
+        /// The partly typed name a chosen filter replaces.
+        replace: Range<usize>,
+    },
+    /// A tag keyword.
+    Keyword {
+        /// The partly typed keyword a chosen one replaces.
+        replace: Range<usize>,
+        /// The tag that closes the innermost region still open at the cursor, offered first.
+        closer: Option<&'static str>,
+    },
+    /// A variable, bound in the template or from its struct.
+    Variable {
+        /// The partly typed name a chosen variable replaces.
+        replace: Range<usize>,
+    },
+    /// A member of a value.
+    Member {
+        /// The chain before the cursor whose members are wanted (`loop`, `order.customer`, `order.items.first()`).
+        object: String,
+        /// Where `object` is in the template.
+        object_range: Range<usize>,
+        /// The partly typed name a chosen member replaces.
+        replace: Range<usize>,
+    },
 }
 
 /// What to offer at `offset`, if anything.
@@ -51,23 +67,24 @@ pub fn at(source: &str, syntax: &Syntax<'_>, offset: usize) -> Option<Completion
         return Some(Completion::Filter { replace });
     }
     if tag.kind == TagKind::Block && typed.is_empty() {
+        // The tags before this one are those of the text before it.
         let earlier = &source[..tag.range.start];
-        let regions = outline::regions(earlier, &tags::scan(earlier, syntax));
+        let regions = outline::regions(earlier, &tags[..tags.len() - 1]);
         let closer = innermost_open(&regions, earlier.len()).and_then(|region| {
             if region.label.starts_with("set") { Some("endset") } else { region.kind.closer() }
         });
         return Some(Completion::Keyword { replace, closer });
     }
     if let Some(object_end) = before[..word_start].strip_suffix('.').map(str::len) {
-        let object_start = before[..object_end].trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == '.').len();
+        // The chain may hold calls and indexing (`order.items.first().`), not only names.
+        let object_start = crate::text::chain_start(before, object_end).max(tag.inner.start);
         let object = &before[object_start..object_end];
-        if object.is_empty() || object.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        if object.is_empty() {
             return None;
         }
-        return Some(Completion::Member { object: object.to_owned(), replace });
+        return Some(Completion::Member { object: object.to_owned(), object_range: object_start..object_end, replace });
     }
-    // Anything else in an expression is a variable, unless it follows `::` (a path) or the
-    // tag names something else (`{% block name %}`).
+    // Anything else in an expression is a variable, unless it follows `::` (a path) or the tag names something else (`{% block name %}`).
     let follows_member = before[..word_start].ends_with(':');
     let names_something = tag.kind == TagKind::Block && crate::navigation::NOT_EXPRESSIONS.contains(&tag.keyword(before));
     let starts_with_digit = before[word_start..].starts_with(|c: char| c.is_ascii_digit());
@@ -77,10 +94,9 @@ pub fn at(source: &str, syntax: &Syntax<'_>, offset: usize) -> Option<Completion
     Some(Completion::Variable { replace })
 }
 
-/// What to offer after a space typed at `offset`, which editors send as a trigger character.
-/// Only where a name is expected next: right after an opening delimiter, after `|`, after a
-/// keyword that takes an expression (`if`, `elif`, `in`, `match`, `when`, `filter`), or after
-/// an operator, `(`, `[` or `,`. Elsewhere, as after a complete name, a space is just a space.
+/// What to offer after a space typed at `offset`, which editors send as a trigger character. Only where a name is expected next: right
+/// after an opening delimiter, after `|`, after a keyword that takes an expression (`if`, `elif`, `in`, `match`, `when`, `filter`), or
+/// after an operator, `(`, `[` or `,`. Elsewhere, as after a complete name, a space is just a space.
 pub fn after_space(source: &str, syntax: &Syntax<'_>, offset: usize) -> Option<Completion> {
     let found = at(source, syntax, offset)?;
     let before = source.get(..offset)?;
@@ -93,8 +109,8 @@ pub fn after_space(source: &str, syntax: &Syntax<'_>, offset: usize) -> Option<C
     wants.then_some(found)
 }
 
-/// Whether the end of `text` is inside a string or char literal that starts at or after
-/// `from`, so the cursor is in the literal and nothing should be offered.
+/// Whether the end of `text` is inside a string or char literal that starts at or after `from`, so the cursor is in the literal and nothing
+/// should be offered.
 fn inside_literal(text: &str, from: usize) -> bool {
     let mut at = from;
     while at < text.len() {
@@ -105,7 +121,7 @@ fn inside_literal(text: &str, from: usize) -> bool {
             }
             at = end;
         } else {
-            at += text[at..].chars().next().map_or(1, char::len_utf8);
+            at = tags::next_char(text, at);
         }
     }
     false
@@ -135,7 +151,7 @@ mod tests {
             Some(Completion::Filter { replace }) => ("filter".to_owned(), source[replace].to_owned()),
             Some(Completion::Keyword { replace, .. }) => ("keyword".to_owned(), source[replace].to_owned()),
             Some(Completion::Variable { replace }) => ("variable".to_owned(), source[replace].to_owned()),
-            Some(Completion::Member { object, replace }) => (format!("member of {object}"), source[replace].to_owned()),
+            Some(Completion::Member { object, replace, .. }) => (format!("member of {object}"), source[replace].to_owned()),
             None => ("none".to_owned(), String::new()),
         }
     }
@@ -155,6 +171,9 @@ mod tests {
         assert_eq!(replaced("{% for x in ite$ %}"), ("variable".to_owned(), "ite".to_owned()));
         assert_eq!(replaced("{{ order.$ }}"), ("member of order".to_owned(), String::new()));
         assert_eq!(replaced("{{ order.customer.na$ }}"), ("member of order.customer".to_owned(), "na".to_owned()));
+        assert_eq!(replaced("{{ order.items.first().$ }}"), ("member of order.items.first()".to_owned(), String::new()));
+        assert_eq!(replaced("{{ a.get(i)[0].na$ }}"), ("member of a.get(i)[0]".to_owned(), "na".to_owned()));
+        assert_eq!(replaced("{{ (a + b).$ }}").0, "none");
         assert_eq!(replaced("{{ 1.$ }}").0, "none");
         assert_eq!(replaced("{{ m::$ }}").0, "none");
         assert_eq!(replaced("{% block ti$ %}").0, "none");

@@ -1,10 +1,8 @@
-// The VS Code side of the Askama extension. It finds the askama-lsp executable, starts it and
-// tells it which files are templates. Every language feature lives in the server. Rust files are
-// sent too, for the features that go from a template struct to its template.
+// The VS Code side of the Askama extension. It finds the askama-lsp executable, starts it and tells it which files are templates. Every
+// language feature lives in the server. Rust files are sent too, for the features that go from a template struct to its template.
 //
-// The client's own part is Askama editing in templates (editing.ts): comment toggling with
-// `{# #}`, auto-closing of `{%`, `{{` and `{#`, and Surround with Tag. Templates keep the `html`
-// language, so these are added here, limited to template files, rather than in a language
+// The client's own part is Askama editing in templates (editing.ts): comment toggling with `{# #}`, auto-closing of `{%`, `{{` and `{#`,
+// and Surround with Tag. Templates keep the `html` language, so these are added here, limited to template files, rather than in a language
 // configuration, which would apply to every HTML file.
 
 import * as fs from "node:fs";
@@ -54,15 +52,24 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     .getConfiguration("askama")
     .get<string[]>("templateGlobs", ["**/templates/**"]);
   const settings = vscode.workspace.getConfiguration("askama");
+  const rustAnalyzer = vscode.workspace.getConfiguration("rust-analyzer");
   const clientOptions: LanguageClientOptions = {
     initializationOptions: {
       typeCompletion: settings.get<boolean>("typeCompletion", true),
       rustAnalyzerPath: rustAnalyzerPath(settings),
+      // The private rust-analyzer runs the crate's build scripts and procedural macros only if the user's own rust-analyzer would.
+      buildScripts: rustAnalyzer.get<boolean>("cargo.buildScripts.enable", true),
+      procMacros: rustAnalyzer.get<boolean>("procMacro.enable", true),
     },
     documentSelector: [
       ...globs.map((pattern) => ({ scheme: "file", pattern })),
       { scheme: "file", language: "rust" },
     ],
+    middleware: {
+      // The server reads Rust files from disk and never uses their unsaved text: it needs them open only to answer for them (the code lens,
+      // going to a template). So their edits, the whole file on every keystroke, are not sent.
+      didChange: (event, next) => (event.document.languageId === "rust" ? Promise.resolve() : next(event)),
+    },
   };
 
   client = new LanguageClient("askama", "Askama Language Server", serverOptions, clientOptions);
@@ -76,11 +83,10 @@ async function stopClient(): Promise<void> {
   }
 }
 
-// The setting wins. Otherwise a packaged extension carries the server in server/, and a
-// development checkout uses the debug build in the repository's own target directory. Run from
-// the checkout (F5), the debug build comes first, so a server/ left by packaging is not used.
+// The setting wins. Otherwise a packaged extension carries the server in server/, and a development checkout uses the debug build in the
+// repository's own target directory. Run from the checkout (F5), the debug build comes first, so a server/ left by packaging is not used.
 function serverPath(context: vscode.ExtensionContext): string | undefined {
-  const configured = vscode.workspace.getConfiguration("askama").get<string>("server.path", "");
+  const configured = userSetting(vscode.workspace.getConfiguration("askama"), "server.path");
   if (configured !== "") {
     return configured;
   }
@@ -91,11 +97,10 @@ function serverPath(context: vscode.ExtensionContext): string | undefined {
   return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
-// The rust-analyzer for type completion: the setting, else the one the rust-analyzer
-// extension ships, else none, and the server looks for `rust-analyzer` on the PATH. The one
-// on the PATH is often only rustup's proxy, which fails unless its component is installed.
+// The rust-analyzer for type completion: the setting, else the one the rust-analyzer extension ships, else none, and the server looks for
+// `rust-analyzer` on the PATH. The one on the PATH is often only rustup's proxy, which fails unless its component is installed.
 function rustAnalyzerPath(settings: vscode.WorkspaceConfiguration): string {
-  const configured = settings.get<string>("rustAnalyzer.path", "");
+  const configured = userSetting(settings, "rustAnalyzer.path");
   if (configured !== "") {
     return configured;
   }
@@ -110,6 +115,12 @@ function rustAnalyzerPath(settings: vscode.WorkspaceConfiguration): string {
   return "";
 }
 
+// A setting's value from the user's own settings only. The settings that name a program to run are `machine` scoped, which VS Code already
+// keeps out of workspace settings; reading only the user's value makes sure a cloned repository's `.vscode/settings.json` never chooses
+// one.
+function userSetting(settings: vscode.WorkspaceConfiguration, key: string): string {
+  return settings.inspect<string>(key)?.globalValue ?? "";
+}
 
 // The templates: HTML files matching `askama.templateGlobs`, as the server is told.
 function isTemplate(document: vscode.TextDocument): boolean {
@@ -118,8 +129,8 @@ function isTemplate(document: vscode.TextDocument): boolean {
   return vscode.languages.match(selector, document) > 0;
 }
 
-// Comments out the selected lines with `{# … #}`, or uncomments them. Cmd+/ runs this in
-// templates; anywhere else it does what Cmd+/ normally does.
+// Comments out the selected lines with `{# … #}`, or uncomments them. Cmd+/ runs this in templates; anywhere else it does what Cmd+/
+// normally does.
 async function toggleTemplateComment(): Promise<void> {
   const editor = vscode.window.activeTextEditor;
   if (editor === undefined) {
@@ -151,8 +162,8 @@ async function toggleTemplateComment(): Promise<void> {
   });
 }
 
-// Wraps the selection in a block tag pair the user picks. Text within a line is wrapped where it
-// is; whole lines, or the cursor's line when nothing is selected, get the tags on their own lines.
+// Wraps the selection in a block tag pair the user picks. Text within a line is wrapped where it is; whole lines, or the cursor's line when
+// nothing is selected, get the tags on their own lines.
 async function surroundWithTag(): Promise<void> {
   const editor = vscode.window.activeTextEditor;
   if (editor === undefined) {
@@ -179,8 +190,8 @@ async function surroundWithTag(): Promise<void> {
   await editor.insertSnippet(new vscode.SnippetString(snippet), range, { undoStopBefore: true, undoStopAfter: true, keepWhitespace: true });
 }
 
-// After `{%`, `{{` or `{#` is typed in a template, adds its closer: `{% | %}`. The editor's own
-// auto-closing has usually put a `}` after the cursor already; that is replaced.
+// After `{%`, `{{` or `{#` is typed in a template, adds its closer: `{% | %}`. The editor's own auto-closing has usually put a `}` after
+// the cursor already; that is replaced.
 function closeTag(event: vscode.TextDocumentChangeEvent): void {
   if (event.reason !== undefined || event.contentChanges.length !== 1) {
     return;

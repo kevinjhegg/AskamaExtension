@@ -1,6 +1,6 @@
 # A small Askama site that exercises what the extension supports: inheritance, includes,
 # macros, a custom filter, loops and htmx attributes. Open this folder in the Extension
-# Development Host to try each step of docs/implementation-plan.md.
+# Development Host to try each feature.
 
 [package]
 name = "sample-site"

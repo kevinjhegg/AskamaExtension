@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Rewraps the prose of Askama comments (`{# ... #}`) so no line passes LIMIT characters.
 
-Only a paragraph with a line over LIMIT is touched, and it is refilled at word boundaries to
-LIMIT, its lines starting where its text starts, never inside an inline `{{ }}` or `{% %}`. A paragraph is a run of lines whose text starts
-at the same column, ended by a blank line, a line that starts a list item (`- `, `* `, `1. `), or
-a code sample: a line whose text starts with `{%`, `{{` or `<`. Code samples are never changed.
-Comments produce no output, so nothing the browser receives changes.
+Only a paragraph with a line over LIMIT is touched, and it is refilled at word boundaries to LIMIT, its lines starting where its text
+starts, never inside an inline `{{ }}` or `{% %}`. A paragraph is a run of lines whose text starts at the same column, ended by a blank
+line, a line that starts a list item (`- `, `* `, `1. `), or a code sample: a line whose text starts with `{%`, `{{` or `<`. Code samples
+are never changed. Comments produce no output, so nothing the browser receives changes.
 
 Usage: askama_comments.py [--check] FILE...
 """
@@ -29,8 +28,7 @@ INLINE_CODE = re.compile(r"\{\{.*?\}\}|\{%.*?%\}")
 
 
 def words_of(text):
-    """The words of prose, an inline `{{ }}` or `{% %}` kept whole. An HTML tag may still break
-    between its attributes."""
+    """The words of prose, an inline `{{ }}` or `{% %}` kept whole. An HTML tag may still break between its attributes."""
     protected = INLINE_CODE.sub(lambda m: m.group(0).replace(" ", "\x00"), text)
     return [word.replace("\x00", " ") for word in protected.split()]
 

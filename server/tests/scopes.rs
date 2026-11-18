@@ -1,5 +1,5 @@
-//! End-to-end tests of the names a template binds: completion, `loop` members, hover,
-//! definition, rename, references, and the unknown-variable warning.
+//! End-to-end tests of the names a template binds: completion, `loop` members, hover, definition, rename, references, and the
+//! unknown-variable warning.
 
 mod common;
 
@@ -53,7 +53,7 @@ fn labels_in_order(items: &Value) -> Vec<String> {
 
 #[test]
 fn warns_about_an_unknown_variable_only() {
-    let (_krate, mut server, uri) = site();
+    let (_krate, server, uri) = site();
     let diagnostics = server.diagnostics_for(&uri);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0]["range"], range((1, 33), (1, 37)));

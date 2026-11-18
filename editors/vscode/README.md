@@ -21,7 +21,8 @@ Templates stay HTML, so VS Code's own HTML support and any extension that works 
 ## Requirements
 
 - A Rust crate using Askama 0.16, with templates in a `templates` directory or where its `askama.toml` says.
-- For completion and errors that need types: rust-analyzer. The extension uses the one the rust-analyzer extension ships, or `askama.rustAnalyzer.path`. It runs its own copy for each crate, started the first time a type is needed; the first answer waits while it loads the crate, and a progress notice says when it is ready.
+- For completion and errors that need types: rust-analyzer. The extension uses the one the rust-analyzer extension ships, or `askama.rustAnalyzer.path`. It runs its own copy for each crate, started the first time a type is needed; the first answer waits while it loads the crate, and a progress notice says when it is ready. Like your own rust-analyzer, it runs the crate's build scripts and procedural macros, unless `rust-analyzer.cargo.buildScripts.enable` or `rust-analyzer.procMacro.enable` turns that off.
+- A trusted workspace. In Restricted Mode the extension stays off, since what it starts runs the crate's code.
 
 ## Settings
 
@@ -29,11 +30,11 @@ Templates stay HTML, so VS Code's own HTML support and any extension that works 
 |---|---|---|
 | `askama.templateGlobs` | `["**/templates/**"]` | Which files are templates. |
 | `askama.typeCompletion` | `true` | Ask rust-analyzer about types. Turn off to save its memory. |
-| `askama.rustAnalyzer.path` | empty | The rust-analyzer to use, if not the rust-analyzer extension's. |
-| `askama.server.path` | empty | A language server other than the bundled one. |
+| `askama.rustAnalyzer.path` | empty | The rust-analyzer to use, if not the rust-analyzer extension's. User settings only. |
+| `askama.server.path` | empty | A language server other than the bundled one. User settings only. |
 | `askama.trace.server` | `off` | Log messages between VS Code and the server. |
 
-Run **Askama: Restart Language Server** after changing a setting.
+Run **Askama: Restart Language Server** after changing a setting. The two path settings name programs to run, so the extension reads them only from your user settings: a repository's `.vscode/settings.json` cannot choose them.
 
 ## Known limits
 

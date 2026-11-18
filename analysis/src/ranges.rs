@@ -6,23 +6,28 @@ use crate::lines::LineIndex;
 use crate::outline::Region;
 use crate::tags::{Tag, TagKind};
 
+/// What a fold folds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldKind {
+    /// A branch of a region.
     Region,
+    /// A comment.
     Comment,
 }
 
-/// A foldable span of lines: `start_line` stays visible, the lines after it up to and
-/// including `end_line` fold away.
+/// A foldable span of lines: `start_line` stays visible, the lines after it up to and including `end_line` fold away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fold {
+    /// The line that stays visible.
     pub start_line: u32,
+    /// The last line that folds away.
     pub end_line: u32,
+    /// What it folds.
     pub kind: FoldKind,
 }
 
-/// One fold per branch of every region that spans lines, ending on the line before the next
-/// branch or the closing tag so that tag stays visible, and one per multi-line comment.
+/// One fold per branch of every region that spans lines, ending on the line before the next branch or the closing tag so that tag stays
+/// visible, and one per multi-line comment.
 pub fn folds(source: &str, lines: &LineIndex, tags: &[Tag], regions: &[Region]) -> Vec<Fold> {
     let line = |offset: usize| lines.position(source, offset).line;
     let mut folds = Vec::new();
@@ -51,9 +56,8 @@ pub fn folds(source: &str, lines: &LineIndex, tags: &[Tag], regions: &[Region]) 
     folds
 }
 
-/// The ranges **Expand Selection** steps through from `offset`, smallest first: the word,
-/// the tag's content, the whole tag, then for each enclosing region its body and the region
-/// itself, and last the whole text. Each range strictly contains the one before it.
+/// The ranges **Expand Selection** steps through from `offset`, smallest first: the word, the tag's content, the whole tag, then for each
+/// enclosing region its body and the region itself, and last the whole text. Each range strictly contains the one before it.
 pub fn selection(source: &str, tags: &[Tag], regions: &[Region], offset: usize) -> Vec<Range<usize>> {
     let mut chain = Vec::new();
     let mut push = |range: Range<usize>| {
@@ -91,7 +95,7 @@ fn word(source: &str, offset: usize) -> Range<usize> {
     if !source.is_char_boundary(offset) {
         return offset..offset;
     }
-    let start = source[..offset].rfind(|c: char| !is_word(c)).map_or(0, |at| at + source[at..].chars().next().map_or(1, char::len_utf8));
+    let start = source[..offset].rfind(|c: char| !is_word(c)).map_or(0, |at| crate::tags::next_char(source, at));
     let end = source[offset..].find(|c: char| !is_word(c)).map_or(source.len(), |at| offset + at);
     start..end
 }

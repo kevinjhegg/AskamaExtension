@@ -1,5 +1,5 @@
-//! End-to-end tests of what the server knows from template structs: variable completion,
-//! hover and definition in templates, and the template lens and link in Rust files.
+//! End-to-end tests of what the server knows from template structs: variable completion, hover and definition in templates, and the
+//! template lens and link in Rust files.
 
 mod common;
 

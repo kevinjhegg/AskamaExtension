@@ -1,22 +1,23 @@
-//! Filters: Askama's built-in ones, the crate's own from its `filters` module, and the
-//! filters a template uses.
+//! Filters: Askama's built-in ones, the crate's own from its `filters` module, and the filters a template uses.
 
 use std::ops::Range;
 use std::path::PathBuf;
 
-use crate::tags::{Tag, TagKind, literal_end};
+use crate::tags::{Tag, TagKind, literal_end, next_char};
 
 /// A filter Askama 0.16 provides, as a template writes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Builtin {
+    /// Its name.
     pub name: &'static str,
     /// How a template calls it, such as `truncate(length)`.
     pub usage: &'static str,
+    /// What it does, in a sentence or two.
     pub description: &'static str,
 }
 
-/// Askama 0.16's built-in filters: the names `askama_derive` 0.16 dispatches on, with
-/// descriptions taken from the documentation of `askama::filters`.
+/// Askama 0.16's built-in filters: the names `askama_derive` 0.16 dispatches on, with descriptions taken from the documentation of
+/// `askama::filters`.
 pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "assigned_or", usage: "assigned_or(fallback)", description: "Renders the value if it is not its type's default value, otherwise `fallback`." },
     Builtin { name: "capitalize", usage: "capitalize", description: "Capitalizes the value: the first character uppercase, all others lowercase." },
@@ -55,6 +56,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "wordcount", usage: "wordcount", description: "Counts the words in the value." },
 ];
 
+/// The built-in filter called `name`, if Askama has one.
 pub fn builtin(name: &str) -> Option<&'static Builtin> {
     BUILTINS.iter().find(|builtin| builtin.name == name)
 }
@@ -62,10 +64,13 @@ pub fn builtin(name: &str) -> Option<&'static Builtin> {
 /// A filter function in the crate's `filters` module, read by `crate::rust`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomFilter {
+    /// The function's name, which is the filter's.
     pub name: String,
     /// The function's signature as written, from `fn` on, with whitespace collapsed.
     pub signature: String,
+    /// Its `///` doc comment, or empty.
     pub docs: String,
+    /// The Rust file it is written in.
     pub file: PathBuf,
     /// The function name's range in `file`.
     pub range: Range<usize>,
@@ -74,13 +79,15 @@ pub struct CustomFilter {
 /// The custom filters of one crate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CrateFilters {
+    /// The filters, in the order their files were read.
     pub filters: Vec<CustomFilter>,
-    /// Whether a `filters` module brings in names this reading cannot follow (a `use`), so
-    /// an unknown name may still be a real filter and must not be flagged.
+    /// Whether a `filters` module brings in names this reading cannot follow (a `use`), so an unknown name may still be a real filter and
+    /// must not be flagged.
     pub incomplete: bool,
 }
 
 impl CrateFilters {
+    /// The custom filter called `name`, if the crate has one.
     pub fn find(&self, name: &str) -> Option<&CustomFilter> {
         self.filters.iter().find(|filter| filter.name == name)
     }
@@ -89,10 +96,11 @@ impl CrateFilters {
 /// A filter a template applies, `|name` or `{% filter name %}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterUse {
+    /// The filter's name, the last segment of a path.
     pub name: String,
+    /// The name's byte range in the template.
     pub range: Range<usize>,
-    /// Whether the filter is named by a path (`module::name`), which Askama resolves as Rust
-    /// does rather than in the `filters` module.
+    /// Whether the filter is named by a path (`module::name`), which Askama resolves as Rust does rather than in the `filters` module.
     pub qualified: bool,
 }
 
@@ -125,7 +133,7 @@ pub fn filter_uses(source: &str, tags: &[Tag]) -> Vec<FilterUse> {
                     continue;
                 }
             }
-            at += source[at..].chars().next().map_or(1, char::len_utf8);
+            at = next_char(source, at);
         }
     }
     uses
@@ -160,7 +168,7 @@ mod tests {
     use crate::testing::TempDir;
 
     fn crate_filters(index: &mut RustIndex, root: &Path) -> CrateFilters {
-        index.crate_facts(root).filters
+        index.crate_facts(root).filters.clone()
     }
 
     fn uses(source: &str) -> Vec<(String, &str, bool)> {
@@ -179,7 +187,7 @@ mod tests {
 
     #[test]
     fn ignores_or_and_pipes_in_strings() {
-        assert!(uses("{% if a || b %}{% endif %}{{ \"a|b\" }}{{ '|' }}").is_empty());
+        assert_eq!(uses("{% if a || b %}{% endif %}{{ \"a|b\" }}{{ '|' }}"), Vec::new());
     }
 
     #[test]

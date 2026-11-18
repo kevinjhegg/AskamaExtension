@@ -6,27 +6,40 @@ members = ["analysis", "server"]
 exclude = ["fixtures/sample-site"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.54", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tower-lsp-server = "0.23"
+# For catching a panic in a request's future (`FutureExt::catch_unwind`), and the `Service`
+# trait the server is wrapped in to do it; both are tower-lsp-server's own dependencies.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tower-service = "0.3"
 askama-analysis = { path = "analysis" }
 # Pinned to the exact release the fixture uses: see docs/design.md, "Versions".
 askama_parser = { version = "=0.16.1", features = ["config"] }
 glob = "0.3"
 # span-locations gives syn's spans line and column outside a proc macro, to locate filters.
-proc-macro2 = { version = "1", features = ["span-locations"] }
-quote = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-syn = { version = "2", features = ["full"] }
-toml = "1"
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+quote = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+syn = { version = "3.0", features = ["full"] }
+toml = "1.2"
+
+# The packaged server: about half the size (3.8 MB instead of 7.6 MB on macOS arm64), for a longer build.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# Every item has a doc comment, public or not.
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+missing_docs_in_private_items = "warn"

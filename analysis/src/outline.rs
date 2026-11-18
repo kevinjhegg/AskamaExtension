@@ -1,26 +1,37 @@
-//! A template's structure: blocks, loops, conditions and the other tags that open a region,
-//! paired with the tags that close them. Outline, folding and selection ranges all come from
-//! it.
+//! A template's structure: blocks, loops, conditions and the other tags that open a region, paired with the tags that close them. Outline,
+//! folding and selection ranges all come from it.
 //!
-//! Pairing is forgiving, so a template being edited still has a structure: a closing tag
-//! with no matching opener is ignored, a closing tag closes any regions left open inside the
-//! one it matches, and a region never closed runs to the end of the text.
+//! Pairing is forgiving, so a template being edited still has a structure: a closing tag with no matching opener is ignored, a closing tag
+//! closes any regions left open inside the one it matches, and a region never closed runs to the end of the text.
+//!
+//! Regions nest at most `MAX_NESTING` deep. Deeper ones, and the tags that close them, are left out of the tree, so a template with
+//! thousands of nested tags cannot make the code that walks the tree recursively (the outline, dropping the tree) overflow its stack.
 
 use std::ops::Range;
 
 use crate::tags::{Tag, TagKind};
+use crate::text::top_level_assignment;
 
+/// The tag that makes a region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionKind {
+    /// `{% block %}`.
     Block,
+    /// `{% for %}`.
     For,
+    /// `{% if %}`, with its `elif` and `else` branches.
     If,
+    /// `{% match %}`, with its `when` and `else` branches.
     Match,
+    /// `{% macro %}`.
     Macro,
+    /// `{% call %}`.
     Call,
+    /// `{% filter %}`.
     Filter,
     /// `let` or `set` in its block form, `{% let x %}…{% endlet %}`.
     Let,
+    /// `{% raw %}`.
     Raw,
     /// `extends`, a single tag.
     Extends,
@@ -31,6 +42,7 @@ pub enum RegionKind {
 }
 
 impl RegionKind {
+    /// The region a tag with `keyword`, followed by `rest`, opens.
     fn opened_by(keyword: &str, rest: &str) -> Option<Self> {
         Some(match keyword {
             "block" => Self::Block,
@@ -47,7 +59,7 @@ impl RegionKind {
     }
 
     /// The tag that closes a region of this kind, or `None` for a single tag.
-    pub fn closer(self) -> Option<&'static str> {
+    pub const fn closer(self) -> Option<&'static str> {
         Some(match self {
             Self::Block => "endblock",
             Self::For => "endfor",
@@ -62,6 +74,7 @@ impl RegionKind {
         })
     }
 
+    /// The region a tag with `keyword` closes.
     fn closed_by(keyword: &str) -> Option<Self> {
         Some(match keyword {
             "endblock" => Self::Block,
@@ -77,6 +90,7 @@ impl RegionKind {
         })
     }
 
+    /// The single-tag region a tag with `keyword` is.
     fn single(keyword: &str) -> Option<Self> {
         Some(match keyword {
             "extends" => Self::Extends,
@@ -86,8 +100,8 @@ impl RegionKind {
         })
     }
 
-    /// Whether a tag with this keyword starts a new branch of the region: `else` and `elif`
-    /// in an `if`, `else` in a `for`, `when` and `else` in a `match`.
+    /// Whether a tag with this keyword starts a new branch of the region: `else` and `elif` in an `if`, `else` in a `for`, `when` and
+    /// `else` in a `match`.
     fn branches_at(self, keyword: &str) -> bool {
         matches!(
             (self, keyword),
@@ -96,8 +110,10 @@ impl RegionKind {
     }
 }
 
+/// A region of a template: an opening tag, its branches and its closing tag, or a single tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Region {
+    /// What makes it.
     pub kind: RegionKind,
     /// The opening tag's text with its whitespace collapsed, such as `for item in order.items`.
     pub label: String,
@@ -109,13 +125,39 @@ pub struct Region {
     pub branches: Vec<Range<usize>>,
     /// The closing tag, if there is one.
     pub closer: Option<Range<usize>>,
-    pub children: Vec<Region>,
+    /// The regions inside it, in order.
+    pub children: Vec<Self>,
 }
 
 impl Region {
     /// Every region in a tree, depth first.
-    pub fn walk<'r>(regions: &'r [Region]) -> Box<dyn Iterator<Item = &'r Region> + 'r> {
-        Box::new(regions.iter().flat_map(|region| std::iter::once(region).chain(Self::walk(&region.children))))
+    pub fn walk(regions: &[Self]) -> Walk<'_> {
+        Walk { stack: vec![regions.iter()] }
+    }
+}
+
+/// The iterator `Region::walk` returns: a stack of the sibling lists being walked.
+pub struct Walk<'r> {
+    /// The unvisited siblings at each depth, innermost last.
+    stack: Vec<std::slice::Iter<'r, Region>>,
+}
+
+impl<'r> Iterator for Walk<'r> {
+    type Item = &'r Region;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let siblings = self.stack.last_mut()?;
+            match siblings.next() {
+                Some(region) => {
+                    self.stack.push(region.children.iter());
+                    return Some(region);
+                }
+                None => {
+                    self.stack.pop();
+                }
+            }
+        }
     }
 }
 
@@ -123,11 +165,17 @@ impl Region {
 pub fn regions(source: &str, tags: &[Tag]) -> Vec<Region> {
     let mut roots = Vec::new();
     let mut open: Vec<Region> = Vec::new();
+    // The kinds of the regions opened beyond `MAX_NESTING`, innermost last, so their closing tags are skipped too.
+    let mut too_deep: Vec<RegionKind> = Vec::new();
 
     for tag in tags.iter().filter(|tag| tag.kind == TagKind::Block) {
         let keyword = tag.keyword(source);
         let rest = tag.rest(source);
         if let Some(kind) = RegionKind::opened_by(keyword, rest) {
+            if open.len() >= MAX_NESTING {
+                too_deep.push(kind);
+                continue;
+            }
             open.push(Region {
                 kind,
                 label: label(source, tag),
@@ -138,11 +186,17 @@ pub fn regions(source: &str, tags: &[Tag]) -> Vec<Region> {
                 children: Vec::new(),
             });
         } else if let Some(kind) = RegionKind::closed_by(keyword) {
+            if too_deep.last() == Some(&kind) {
+                too_deep.pop();
+                continue;
+            }
             let Some(index) = open.iter().rposition(|region| region.kind == kind) else {
                 continue;
             };
-            while open.len() > index + 1 {
-                let mut unclosed = open.pop().unwrap_or_else(|| unreachable!());
+            // Regions left open inside it end where it is closed, each inside its parent.
+            while open.len() > index + 1
+                && let Some(mut unclosed) = open.pop()
+            {
                 unclosed.range.end = tag.range.start;
                 attach(&mut open, &mut roots, unclosed);
             }
@@ -176,6 +230,10 @@ pub fn regions(source: &str, tags: &[Tag]) -> Vec<Region> {
     roots
 }
 
+/// How deep regions nest in the tree at most. Real templates nest a handful deep.
+pub const MAX_NESTING: usize = 128;
+
+/// Puts a finished region into the innermost open region, or among the roots.
 fn attach(open: &mut [Region], roots: &mut Vec<Region>, region: Region) {
     match open.last_mut() {
         Some(parent) => parent.children.push(region),
@@ -196,15 +254,34 @@ fn label(source: &str, tag: &Tag) -> String {
     }
 }
 
-/// Whether `let` or `set` assigns a value (`= …`), which makes it a single tag rather than
-/// the opening of a block. Comparison operators do not count.
+/// Whether `let` or `set` assigns a value (`= …`), which makes it a single tag rather than the opening of a block. Comparison operators do
+/// not count.
 fn has_assignment(rest: &str) -> bool {
-    let bytes = rest.as_bytes();
-    bytes.iter().enumerate().any(|(at, &byte)| {
-        byte == b'='
-            && !matches!(at.checked_sub(1).map(|before| bytes[before]), Some(b'=' | b'!' | b'<' | b'>'))
-            && bytes.get(at + 1) != Some(&b'=')
-    })
+    top_level_assignment(rest, 0..rest.len()).is_some()
+}
+
+#[cfg(test)]
+mod nesting_tests {
+    use super::*;
+    use crate::config::default_syntax;
+    use crate::tags::scan;
+
+    /// How deep a region tree goes.
+    fn depth(regions: &[Region]) -> usize {
+        regions.iter().map(|region| 1 + depth(&region.children)).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn nests_regions_at_most_max_nesting_deep() {
+        let deep = 1000;
+        let source = format!("{}{}{{% block after %}}{{% endblock %}}", "{% if x %}".repeat(deep), "{% endif %}".repeat(deep));
+        let regions = regions(&source, &scan(&source, &default_syntax()));
+        assert_eq!(depth(&regions), MAX_NESTING);
+        // The closing tags of the regions left out are skipped, so the outer regions still close and what follows is still read.
+        assert_eq!(regions.len(), 2);
+        assert!(regions[0].closer.is_some());
+        assert_eq!(regions[1].kind, RegionKind::Block);
+    }
 }
 
 #[cfg(test)]
@@ -275,8 +352,7 @@ mod tests {
 
     #[test]
     fn survives_unbalanced_tags() {
-        // An `endfor` closes the `if` left open inside it, a stray `endmacro` is ignored, and
-        // the unclosed `block` runs to the end.
+        // An `endfor` closes the `if` left open inside it, a stray `endmacro` is ignored, and the unclosed `block` runs to the end.
         let source = "{% block a %}{% for x in xs %}{% if x %}{% endfor %}{% endmacro %}tail";
         let regions = tree(source);
         assert_eq!(regions[0].range, 0..source.len());

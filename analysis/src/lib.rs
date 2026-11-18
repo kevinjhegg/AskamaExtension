@@ -1,6 +1,5 @@
-//! The analysis behind `askama-lsp`. It knows Askama and Rust but not the Language Server
-//! Protocol, so every feature can be tested on plain strings and temporary directories. The
-//! server crate only translates between LSP and this crate.
+//! The analysis behind `askama-lsp`. It knows Askama and Rust but not the Language Server Protocol, so every feature can be tested on plain
+//! strings and temporary directories. The server crate only translates between LSP and this crate.
 
 pub mod completion;
 pub mod config;
@@ -16,14 +15,15 @@ pub mod rust;
 pub mod scopes;
 pub mod tags;
 pub mod template;
+pub mod text;
 
 #[cfg(test)]
 mod testing {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A directory under the system temporary directory, removed when dropped. The name
-    /// combines the process id with a counter, so tests running at once never share one.
+    /// A directory under the system temporary directory, removed when dropped. The name combines the process id with a counter, so tests
+    /// running at once never share one.
     pub struct TempDir(PathBuf);
 
     impl TempDir {
@@ -41,7 +41,7 @@ mod testing {
 
         pub fn write(&self, relative: &str, contents: &str) {
             let path = self.path(relative);
-            std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/"))).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("/"))).unwrap();
             std::fs::write(path, contents).unwrap();
         }
     }

@@ -1,5 +1,4 @@
-//! The extension's test bed. `cargo run` renders the order page to stdout, which proves the
-//! templates compile with Askama itself.
+//! The extension's test bed. `cargo run` renders the order page to stdout, which proves the templates compile with Askama itself.
 
 use askama::Template;
 

@@ -9,12 +9,18 @@ use askama_parser::{Parsed, Syntax};
 /// A mistake in a template: the byte range to mark and Askama's message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
+    /// The byte range to mark.
     pub range: Range<usize>,
+    /// Askama's message.
     pub message: String,
 }
 
-/// Parses a template. On failure, gives Askama's message on the word where parsing stopped.
-/// The parser stops at the first mistake, so there is at most one.
+/// Parses a template. On failure, gives Askama's message on the word where parsing stopped. The parser stops at the first mistake, so there
+/// is at most one.
+///
+/// # Errors
+///
+/// When the template is not valid Askama, or the parser panics on it.
 pub fn parse(source: Arc<str>, syntax: &Syntax<'_>) -> Result<Parsed, Problem> {
     let text = Arc::clone(&source);
     // A panic in the parser must cost one diagnostic, not the language server.
@@ -25,7 +31,7 @@ pub fn parse(source: Arc<str>, syntax: &Syntax<'_>) -> Result<Parsed, Problem> {
             range: word_at(&text, error.offset),
             message: error
                 .message
-                .map_or_else(|| "failed to parse template source".to_owned(), |message| message.into_owned()),
+                .map_or_else(|| "failed to parse template source".to_owned(), std::borrow::Cow::into_owned),
         }),
         Err(_) => Err(Problem {
             range: 0..0,
@@ -34,13 +40,10 @@ pub fn parse(source: Arc<str>, syntax: &Syntax<'_>) -> Result<Parsed, Problem> {
     }
 }
 
-/// The run of non-whitespace text starting at `offset`, so an error marks the word Askama
-/// stopped at rather than a single point. Empty at the end of the text.
+/// The run of non-whitespace text starting at `offset`, so an error marks the word Askama stopped at rather than a single point. Empty at
+/// the end of the text.
 fn word_at(text: &str, offset: usize) -> Range<usize> {
-    let mut start = offset.min(text.len());
-    while !text.is_char_boundary(start) {
-        start -= 1;
-    }
+    let start = text.floor_char_boundary(offset);
     let rest = &text[start..];
     let length = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let length = if length == 0 { rest.chars().next().map_or(0, char::len_utf8) } else { length };

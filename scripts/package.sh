@@ -18,7 +18,8 @@ mkdir -p editors/vscode/server
 cp target/release/askama-lsp editors/vscode/server/askama-lsp
 
 cd editors/vscode
-npm install --no-audit --no-fund
+# Exactly what package-lock.json holds, never newer versions a fresh resolution would pick.
+npm ci --no-audit --no-fund
 version=$(node -p "require('./package.json').version")
 # vscode:prepublish bundles the client. The bundle holds every dependency, so none are packed;
 # the extension is private, so it has no license file or repository to show.

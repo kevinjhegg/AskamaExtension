@@ -1,20 +1,24 @@
-//! Conversion between byte offsets, which Askama's parser reports, and line and column
-//! positions, which editors use. Columns count UTF-16 code units, the LSP default encoding.
+//! Conversion between byte offsets, which Askama's parser reports, and line and column positions, which editors use. Columns count UTF-16
+//! code units, the LSP default encoding.
 
 /// A position in a text: a zero-based line and a zero-based column in UTF-16 code units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position {
+    /// The line, from 0.
     pub line: u32,
+    /// The column in UTF-16 code units, from 0.
     pub character: u32,
 }
 
 /// Where each line of a text starts, for converting offsets in either direction.
 #[derive(Debug, Clone)]
 pub struct LineIndex {
+    /// The byte offset each line starts at, the first line's 0.
     line_starts: Vec<usize>,
 }
 
 impl LineIndex {
+    /// The index of `text`. The other methods must be given the same text.
     pub fn new(text: &str) -> Self {
         let line_starts = std::iter::once(0)
             .chain(text.match_indices('\n').map(|(at, _)| at + 1))
@@ -22,18 +26,17 @@ impl LineIndex {
         Self { line_starts }
     }
 
-    /// The position of a byte offset. An offset past the end, or inside a character, is moved
-    /// back to the nearest character boundary.
+    /// The position of a byte offset. An offset past the end, or inside a character, is moved back to the nearest character boundary.
     pub fn position(&self, text: &str, offset: usize) -> Position {
-        let offset = floor_char_boundary(text, offset);
+        let offset = text.floor_char_boundary(offset);
         let line = self.line_starts.partition_point(|&start| start <= offset) - 1;
         let start = self.line_starts[line];
         let character = text[start..offset].encode_utf16().count();
         Position { line: to_u32(line), character: to_u32(character) }
     }
 
-    /// The byte offset of a position. A line past the end gives the end of the text, and a
-    /// column past the end of its line gives the end of that line.
+    /// The byte offset of a position. A line past the end gives the end of the text, and a column past the end of its line gives the end of
+    /// that line.
     pub fn offset(&self, text: &str, position: Position) -> usize {
         let Some(&start) = self.line_starts.get(position.line as usize) else {
             return text.len();
@@ -53,14 +56,8 @@ impl LineIndex {
     }
 }
 
-fn floor_char_boundary(text: &str, offset: usize) -> usize {
-    let mut offset = offset.min(text.len());
-    while !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
-}
 
+/// A count as LSP's `u32`, the largest one for a count too big for it.
 fn to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }

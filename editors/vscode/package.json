@@ -17,6 +17,12 @@
     "workspaceContains:**/templates/**/*.html"
   ],
   "main": "./out/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Askama IntelliSense starts a language server and, for type completion, a rust-analyzer that runs the crate's build scripts and procedural macros, so it runs only in trusted workspaces."
+    }
+  },
   "contributes": {
     "configuration": {
       "title": "Askama",
@@ -24,7 +30,8 @@
         "askama.server.path": {
           "type": "string",
           "default": "",
-          "description": "Path to the askama-lsp executable. Leave empty to use the one built in this repository (development) or bundled with the extension."
+          "scope": "machine",
+          "description": "Path to the askama-lsp executable. Leave empty to use the one built in this repository (development) or bundled with the extension. Only user settings can set it, never a workspace's, since it names a program to run."
         },
         "askama.templateGlobs": {
           "type": "array",
@@ -44,7 +51,8 @@
         "askama.rustAnalyzer.path": {
           "type": "string",
           "default": "",
-          "description": "The rust-analyzer executable for type completion. Leave empty to use the one the rust-analyzer extension ships, or else `rust-analyzer` on the PATH. Restart the language server after changing this."
+          "scope": "machine",
+          "description": "The rust-analyzer executable for type completion. Leave empty to use the one the rust-analyzer extension ships, or else `rust-analyzer` on the PATH. Only user settings can set it, never a workspace's, since it names a program to run. It follows the `rust-analyzer.cargo.buildScripts.enable` and `rust-analyzer.procMacro.enable` settings. Restart the language server after changing this."
         },
         "askama.trace.server": {
           "type": "string",
@@ -118,6 +126,14 @@
   },
   "dependencies": {
     "vscode-languageclient": "^11.0.0"
+  },
+  "overrides": {
+    "vscode-languageclient": {
+      "minimatch": "^11.0.1"
+    },
+    "@vscode/vsce": {
+      "minimatch": "^11.0.1"
+    }
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

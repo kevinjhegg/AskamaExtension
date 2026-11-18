@@ -1,5 +1,5 @@
-// Askama editing conveniences as plain text transformations, kept apart from the VS Code API
-// so they can be tested on their own (editing.test.ts). extension.ts applies them to editors.
+// Askama editing conveniences as plain text transformations, kept apart from the VS Code API so they can be tested on their own
+// (editing.test.ts). extension.ts applies them to editors.
 
 /** The block tags Surround with Tag offers, with the placeholder for their argument. */
 export const SURROUND_TAGS: ReadonlyArray<{ tag: string; argument: string; closer: string }> = [
@@ -15,8 +15,8 @@ export const SURROUND_TAGS: ReadonlyArray<{ tag: string; argument: string; close
 ];
 
 /**
- * Comments out lines with `{# … #}`, or uncomments them if they already are: the first line
- * starts with `{#` and the last ends with `#}`, ignoring indentation and trailing spaces.
+ * Comments out lines with `{# … #}`, or uncomments them if they already are: the first line starts with `{#` and the last ends with `#}`,
+ * ignoring indentation and trailing spaces.
  */
 export function toggleComment(lines: readonly string[]): string[] {
   if (lines.length === 0) {
@@ -56,11 +56,9 @@ const OPENERS: ReadonlyArray<{ open: string; close: string }> = [
 ];
 
 /**
- * After a keystroke that leaves `before` to the left of the cursor and `after` to its right:
- * if it just completed `{%`, `{{` or `{#`, the edit that turns it into `{% | %}` (the cursor
- * at `|`). The editor may already have auto-closed `{` with `}`, so up to as many `}` as the
- * opener has braces are replaced. Nothing if the closer is already there or the opener is part
- * of a longer run of braces.
+ * After a keystroke that leaves `before` to the left of the cursor and `after` to its right: if it just completed `{%`, `{{` or `{#`, the
+ * edit that turns it into `{% | %}` (the cursor at `|`). The editor may already have auto-closed `{` with `}`, so up to as many `}` as the
+ * opener has braces are replaced. Nothing if the closer is already there or the opener is part of a longer run of braces.
  */
 export function autoClose(before: string, after: string): AutoClose | undefined {
   const opener = OPENERS.find(({ open }) => before.endsWith(open));
@@ -70,8 +68,7 @@ export function autoClose(before: string, after: string): AutoClose | undefined 
   const braces = (opener.open.match(/\{/g) ?? []).length;
   const autoClosed = Math.min((after.match(/^\}*/) ?? [""])[0].length, braces);
   const rest = after.slice(autoClosed);
-  // The editor's auto-closed braces look like `}}` themselves, so only a closer after them
-  // counts as one already there.
+  // The editor's auto-closed braces look like `}}` themselves, so only a closer after them counts as one already there.
   if (rest.trimStart().startsWith(opener.close)) {
     return undefined;
   }
@@ -84,8 +81,8 @@ export function escapeSnippet(text: string): string {
 }
 
 /**
- * The snippet that wraps `selected` in `tag`'s pair. Text within one line is wrapped inline;
- * whole lines get the tags on lines of their own, at the first line's indentation.
+ * The snippet that wraps `selected` in `tag`'s pair. Text within one line is wrapped inline; whole lines get the tags on lines of their
+ * own, at the first line's indentation.
  */
 export function surround(tag: string, selected: string, wholeLines: boolean): string {
   const entry = SURROUND_TAGS.find((candidate) => candidate.tag === tag);

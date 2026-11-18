@@ -1,5 +1,4 @@
-//! The client side of an LSP session with the `askama-lsp` binary, and temporary crates to
-//! point it at, shared by the end-to-end tests.
+//! The client side of an LSP session with the `askama-lsp` binary, and temporary crates to point it at, shared by the end-to-end tests.
 
 #![allow(dead_code, reason = "each test file uses its own subset of these helpers")]
 
@@ -48,18 +47,20 @@ impl Session {
             }
         });
         let mut session = Self { child, stdin, messages, next_id: 1 };
-        session.request("initialize", json!({ "capabilities": {}, "initializationOptions": initialization_options }));
+        let mut params = json!({ "capabilities": {} });
+        params["initializationOptions"] = initialization_options;
+        session.request("initialize", params);
         session.notify("initialized", json!({}));
         session
     }
 
-    pub fn send(&mut self, message: Value) {
+    pub fn send(&mut self, message: &Value) {
         let body = message.to_string();
         write!(self.stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
         self.stdin.flush().unwrap();
     }
 
-    pub fn receive(&mut self) -> Value {
+    pub fn receive(&self) -> Value {
         match self.messages.recv_timeout(MESSAGE_TIMEOUT) {
             Ok(message) => message,
             Err(RecvTimeoutError::Timeout) => panic!("no message from the server within {MESSAGE_TIMEOUT:?}"),
@@ -68,23 +69,28 @@ impl Session {
     }
 
     pub fn notify(&mut self, method: &str, params: Value) {
-        self.send(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+        let mut message = json!({ "jsonrpc": "2.0", "method": method });
+        message["params"] = params;
+        self.send(&message);
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id;
         self.next_id += 1;
-        self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        let mut message = json!({ "jsonrpc": "2.0", "id": id, "method": method });
+        message["params"] = params;
+        self.send(&message);
         loop {
-            let message = self.receive();
-            if message["id"] == id {
-                return message["result"].clone();
+            let mut message = self.receive();
+            // The server numbers its own requests to the client too, so only a message without a method is the answer.
+            if message["id"] == id && message.get("method").is_none() {
+                return message["result"].take();
             }
         }
     }
 
     /// The next diagnostics published for `uri`, skipping other messages.
-    pub fn diagnostics_for(&mut self, uri: &str) -> Vec<Value> {
+    pub fn diagnostics_for(&self, uri: &str) -> Vec<Value> {
         loop {
             let message = self.receive();
             if message["method"] == "textDocument/publishDiagnostics" && message["params"]["uri"] == uri {

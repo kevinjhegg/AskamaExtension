@@ -1,117 +1,169 @@
 //! `askama-lsp`: the language server behind the Askama VS Code extension.
 //!
-//! It speaks the Language Server Protocol over stdin and stdout. The VS Code client starts it
-//! and sends it the templates the user opens. The analysis itself lives in `askama-analysis`;
-//! this crate translates between it and LSP. See `docs/design.md` for the design and
-//! `docs/implementation-plan.md` for the steps that build it up.
+//! It speaks the Language Server Protocol over stdin and stdout. The VS Code client starts it and sends it the templates the user opens.
+//! The analysis itself lives in `askama-analysis`; this crate translates between it and LSP. See `docs/design.md` for the design.
+//!
+//! tower-lsp runs a few requests at once, and they share the server's state behind one lock. Each request holds it only to copy out what it
+//! needs (a document's text, a crate's configuration), never while it reads files or parses Rust, so one slow request does not hold up the
+//! others. The Rust index has a lock of its own for the same reason.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range as ByteRange;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use askama_analysis::config::{CONFIG_FILE_NAME, Config, ConfigError};
-use askama_analysis::lines::{LineIndex, Position as TextPosition};
 use askama_analysis::completion::{self, Completion, KEYWORDS};
+use askama_analysis::config::{CONFIG_FILE_NAME, Config, ConfigError};
 use askama_analysis::filters::{self, BUILTINS, CrateFilters, FilterUse};
+use askama_analysis::lines::{LineIndex, Position as TextPosition};
 use askama_analysis::lowering::{self, Template};
-use askama_analysis::probe;
-use askama_analysis::rust::{CrateFacts, Member, MemberKind, RustIndex};
-use askama_analysis::scopes::{self, Binding, BindingKind, LOOP_MEMBERS};
-use askama_analysis::navigation::{self, Project};
+use askama_analysis::navigation::{self, FileCache, Project, Reader};
 use askama_analysis::outline::{self, Region, RegionKind};
+use askama_analysis::probe;
 use askama_analysis::ranges::{self, FoldKind};
+use askama_analysis::rust::{CrateFacts, Member, MemberKind, RustIndex, TemplateStruct};
+use askama_analysis::scopes::{self, Binding, BindingKind, LOOP_MEMBERS};
 use askama_analysis::{project, tags, template};
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp_server::ls_types::{
     CodeLens, CodeLensOptions, CodeLensParams, Command, CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    CompletionTextEdit, Diagnostic, DiagnosticSeverity, Documentation, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, MarkupContent, MarkupKind, TextEdit, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentLink, DocumentLinkOptions, DocumentLinkParams,
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
-    FileSystemWatcher, FoldingRange, FoldingRangeKind, FoldingRangeParams,
-    FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse,
-    ImplementationProviderCapability, InitializeParams, PrepareRenameResponse, RenameOptions,
-    RenameParams, WorkspaceEdit, InitializeResult, InitializedParams,
-    Location, MessageType, OneOf, Position, Range, ReferenceParams, Registration, SelectionRange,
-    SelectionRangeParams, SelectionRangeProviderCapability, ServerCapabilities, ServerInfo,
-    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    Uri, WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    CompletionTextEdit, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentLink, DocumentLinkOptions,
+    DocumentLinkParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Documentation, FileChangeType, FileSystemWatcher,
+    FoldingRange, FoldingRangeKind, FoldingRangeParams, FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, ImplementationProviderCapability, InitializeParams,
+    InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, Position,
+    PrepareRenameResponse, Range, ReferenceParams, Registration, RenameOptions, RenameParams, SelectionRange, SelectionRangeParams,
+    SelectionRangeProviderCapability, ServerCapabilities, ServerInfo, SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
+    RelativePattern, TextDocumentSyncKind, TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbol, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
-use tower_lsp_server::ls_types::NumberOrString;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 mod analyzer;
+mod panics;
 
 use analyzer::Analyzer;
+use panics::CatchPanics;
 
 /// The `source` shown beside each diagnostic.
 const SOURCE: &str = "askama";
 
+/// How long a crate's rust-analyzer may go unasked before it is stopped, to free its memory. Starting it again takes seconds.
+const ANALYZER_IDLE_LIMIT: Duration = Duration::from_secs(10 * 60);
+
+/// How often an idle rust-analyzer is looked for.
+const ANALYZER_IDLE_CHECK: Duration = Duration::from_secs(60);
+
+/// How long after an edit a template's type check starts, if no newer edit came.
+const TYPE_CHECK_DELAY: Duration = Duration::from_millis(250);
+
+/// How long the list of crates in the workspace folders is reused by workspace symbols, which the editor asks for on every keystroke of the
+/// query.
+const CRATE_ROOTS_LIFETIME: Duration = Duration::from_secs(10);
+
+/// The language server. Cloning it is cheap and shares everything, so a background task can have its own.
+#[derive(Clone)]
 struct Backend {
+    /// The connection to the editor.
     client: Client,
     /// Whether the client lets the server ask it to watch `askama.toml` files.
-    can_watch_files: AtomicBool,
-    state: Mutex<State>,
+    can_watch_files: Arc<AtomicBool>,
+    /// Whether the client can watch files under a given directory (LSP's relative patterns), which watching template directories needs.
+    can_watch_relative: Arc<AtomicBool>,
+    /// Everything else the requests share.
+    state: Arc<Mutex<State>>,
+    /// What each crate's Rust code says: custom filters and template structs, reread for files that changed on disk. Behind its own lock,
+    /// since reading it may parse Rust.
+    rust: Arc<Mutex<RustIndex>>,
 }
 
+/// What the requests share.
 #[derive(Default)]
 struct State {
     /// The workspace folders the client opened, searched for crates by workspace symbols.
     folders: Vec<PathBuf>,
+    /// The crates found in `folders`, and when they were looked for.
+    crate_roots: Option<(Instant, Vec<PathBuf>)>,
+    /// The documents the editor has open, by URI.
     documents: HashMap<Uri, Document>,
-    /// Each crate's configuration, by crate root, read on first use and dropped when its
-    /// `askama.toml` changes.
+    /// Each crate's configuration, by crate root, read on first use and dropped when its `askama.toml` changes.
     configs: HashMap<PathBuf, Arc<Config>>,
-    /// What each crate's Rust code says: custom filters and template structs, reread for
-    /// files that changed on disk.
-    rust: RustIndex,
     /// Whether completion may ask rust-analyzer about types (`askama.typeCompletion`).
     type_completion: bool,
     /// The rust-analyzer executable to start.
     rust_analyzer: String,
+    /// What the private rust-analyzers may run of a crate's code, from the user's rust-analyzer settings.
+    permissions: analyzer::Permissions,
     /// Whether the client shows progress the server starts.
     can_show_progress: bool,
     /// Each crate's rust-analyzer, by crate root, started on first use.
     analyzers: HashMap<PathBuf, Arc<tokio::sync::OnceCell<Option<Arc<Analyzer>>>>>,
-    /// The latest type errors of each template, kept in what the check publishes until the
-    /// next type check replaces them.
+    /// The type check waiting or running for each template, cancelled by the next edit.
+    type_checks: HashMap<Uri, tokio::task::AbortHandle>,
+    /// The latest type errors of each template, kept in what the check publishes until the next type check replaces them.
     type_errors: HashMap<Uri, Vec<Diagnostic>>,
     /// The diagnostics the check last published for each template, with the version.
     checked: HashMap<Uri, (i32, Vec<Diagnostic>)>,
+    /// The file cache of each crate whose template directories are watched, by crate root, cleared on every change there.
+    file_caches: HashMap<PathBuf, Arc<Mutex<FileCache>>>,
+    /// The crates whose template directories have been asked to be watched (or could not be), so each is asked once per configuration.
+    watched_roots: HashSet<PathBuf>,
+    /// The crates whose configuration was read and whose template directories are still to be watched.
+    unwatched_roots: Vec<PathBuf>,
+    /// How many watcher registrations have been made, for unique registration ids.
+    registrations: usize,
 }
 
+/// An open document.
 struct Document {
+    /// Its text in the editor, saved or not.
     text: Arc<str>,
+    /// The editor's version of that text.
     version: i32,
     /// A Rust file the client sends for the struct-to-template features, not a template.
     rust: bool,
 }
 
+/// A position in an open template, with what the requests about it need.
+struct Cursor<'a> {
+    /// The template's URI.
+    uri: &'a Uri,
+    /// Its crate's configuration.
+    config: &'a Config,
+    /// Its text.
+    text: &'a str,
+    /// The byte offset of the position.
+    offset: usize,
+}
+
 /// What completion does next: answer now, or ask rust-analyzer about a probe first.
 enum CompletionStep {
+    /// The items, from the server's own analysis.
     Done(Option<Vec<CompletionItem>>),
+    /// The probe to ask about.
     Probe(ProbePlan),
 }
 
 /// Where a probe for a template position comes from (see `Backend::probe_scope`).
 struct ProbeScope {
+    /// The crate's root.
     root: PathBuf,
-    template_struct: askama_analysis::rust::TemplateStruct,
+    /// The struct whose file the probe goes in.
+    template_struct: TemplateStruct,
+    /// The statements that bring the template's names into scope.
     setup: lowering::Setup,
-    /// Whether the path starts at a name the template binds, not at a struct member.
-    local: bool,
+    /// The template's expressions the probe was asked to write (see `probe_scope`), in Rust as the probe's method sees them.
+    lowered: Vec<String>,
     /// The struct's file on disk.
     rust_text: String,
 }
 
-/// rust-analyzer's diagnostic codes that are type errors in a template expression: no such
-/// field or method, the wrong number of arguments, a private field or method. It gives rustc's
-/// error codes where they exist (`E0599`), and its own names elsewhere or in older releases.
+/// rust-analyzer's diagnostic codes that are type errors in a template expression: no such field or method, the wrong number of arguments,
+/// a private field or method. It gives rustc's error codes where they exist (`E0599`), and its own names elsewhere or in older releases.
 const TYPE_ERROR_CODES: &[&str] = &[
     "E0559", "E0609", "E0599", "E0061", "E0616", "E0624",
     "unresolved-field", "unresolved-method", "mismatched-arg-count", "private-field", "private-assoc-item",
@@ -122,12 +174,15 @@ const TYPE_PROBE_PREFIX: &str = "let _ = &(";
 
 /// A probe with every expression of a template, for its type errors.
 struct TypeProbe {
+    /// The crate's rust-analyzer, running and ready.
     analyzer: Arc<Analyzer>,
     /// The struct's Rust file, which the probe replaces in rust-analyzer's memory.
-    file: PathBuf,
+    file: Arc<Path>,
+    /// The probed file's text.
     text: String,
-    /// The template's version and text the probe was made from.
+    /// The template's version the probe was made from.
     version: i32,
+    /// The template's text the probe was made from.
     template_text: Arc<str>,
     /// The probe line of each expression, and the expression's way back to the template.
     blocks: Vec<(u32, lowering::Mapped)>,
@@ -135,75 +190,100 @@ struct TypeProbe {
 
 /// A probe for a name in a template path, and the name's range in the template.
 struct PathProbe {
+    /// The crate's root.
     root: PathBuf,
-    file: PathBuf,
+    /// The struct's Rust file, which the probe replaces in rust-analyzer's memory.
+    file: Arc<Path>,
+    /// The probe, positioned at the name.
     probe: probe::Probe,
+    /// The name's range in the template.
     range: Range,
 }
 
 /// A probe to show the crate's rust-analyzer, and where its answers go in the template.
 struct ProbePlan {
+    /// The crate's root.
     root: PathBuf,
     /// The struct's Rust file, which the probe replaces in rust-analyzer's memory.
-    file: PathBuf,
+    file: Arc<Path>,
+    /// The probed file's text.
     text: String,
+    /// Where to ask for completion, in `text`.
     position: TextPosition,
+    /// The range in the template that a chosen item replaces.
     range: Range,
 }
 
 /// Diagnostics computed while holding the state lock, published after releasing it.
 struct Publication {
+    /// The file they are for.
     uri: Uri,
+    /// The diagnostics.
     diagnostics: Vec<Diagnostic>,
+    /// The document version they were computed for, `None` for a file that is not open.
     version: Option<i32>,
 }
 
 impl LanguageServer for Backend {
-    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        let can_watch_files = params
-            .capabilities
+    async fn initialize(&self, mut params: InitializeParams) -> Result<InitializeResult> {
+        let capabilities = &params.capabilities;
+        let can_watch_files = capabilities
             .workspace
-            .and_then(|workspace| workspace.did_change_watched_files)
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
             .and_then(|watched| watched.dynamic_registration)
             .unwrap_or(false);
+        let can_watch_relative = capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+            .and_then(|watched| watched.relative_pattern_support)
+            .unwrap_or(false);
+        let can_show_progress = capabilities.window.as_ref().and_then(|window| window.work_done_progress).unwrap_or(false);
         self.can_watch_files.store(can_watch_files, Ordering::Relaxed);
-        {
-            // Set by the client from `askama.typeCompletion` and `askama.rustAnalyzer.path`.
-            let options = params.initialization_options.clone().unwrap_or_default();
-            let mut state = self.lock();
-            state.type_completion = options["typeCompletion"].as_bool().unwrap_or(true);
-            state.rust_analyzer = options["rustAnalyzerPath"].as_str().filter(|path| !path.is_empty()).unwrap_or("rust-analyzer").to_owned();
-            state.can_show_progress = params.capabilities.window.as_ref().and_then(|window| window.work_done_progress).unwrap_or(false);
-        }
-        self.lock().folders = params
+        self.can_watch_relative.store(can_watch_files && can_watch_relative, Ordering::Relaxed);
+        // Set by the client from `askama.typeCompletion`, `askama.rustAnalyzer.path` and the user's rust-analyzer settings for build
+        // scripts and procedural macros.
+        let options = params.initialization_options.take().unwrap_or_default();
+        let folders = params
             .workspace_folders
             .unwrap_or_default()
             .iter()
-            .filter_map(|folder| folder.uri.to_file_path().map(|path| path.into_owned()))
+            .filter_map(|folder| folder.uri.to_file_path().map(std::borrow::Cow::into_owned))
             .collect();
+        {
+            let mut state = self.lock();
+            state.type_completion = options["typeCompletion"].as_bool().unwrap_or(true);
+            let defaults = analyzer::Permissions::default();
+            state.permissions = analyzer::Permissions {
+                build_scripts: options["buildScripts"].as_bool().unwrap_or(defaults.build_scripts),
+                proc_macros: options["procMacros"].as_bool().unwrap_or(defaults.proc_macros),
+            };
+            options["rustAnalyzerPath"].as_str().filter(|path| !path.is_empty()).unwrap_or("rust-analyzer").clone_into(&mut state.rust_analyzer);
+            state.can_show_progress = can_show_progress;
+            state.folders = folders;
+        }
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
-                )),
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-                document_link_provider: Some(DocumentLinkOptions { resolve_provider: Some(false), work_done_progress_options: Default::default() }),
+                document_link_provider: Some(DocumentLinkOptions { resolve_provider: Some(false), work_done_progress_options: WorkDoneProgressOptions::default() }),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    // A space opens the list only where a name belongs, as in `{{ ` or `{% if `.
-                    // A `.` opens members where they are known, as after `loop.`.
+                    // A space opens the list only where a name belongs, as in `{{ ` or `{% if `. A `.` opens members where they are known,
+                    // as after `loop.`.
                     trigger_characters: Some(vec!["|".to_owned(), " ".to_owned(), ".".to_owned()]),
                     ..CompletionOptions::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 code_lens_provider: Some(CodeLensOptions { resolve_provider: Some(false) }),
-                rename_provider: Some(OneOf::Right(RenameOptions { prepare_provider: Some(true), work_done_progress_options: Default::default() })),
+                rename_provider: Some(OneOf::Right(RenameOptions { prepare_provider: Some(true), work_done_progress_options: WorkDoneProgressOptions::default() })),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -232,8 +312,8 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        // Store the document before the first `.await`: requests run concurrently with
-        // notifications, and a client asks about a document right after opening it.
+        // Store the document before the first `.await`: requests run concurrently with notifications, and a client asks about a document
+        // right after opening it.
         let text = Arc::from(document.text);
         let rust = document.language_id == "rust";
         self.lock().documents.insert(document.uri.clone(), Document { text, version: document.version, rust });
@@ -241,7 +321,7 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, format!("Opened {}.", document.uri.as_str()))
             .await;
         self.check(vec![document.uri.clone()]).await;
-        self.type_check(document.uri).await;
+        self.schedule_type_check(document.uri);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -256,12 +336,20 @@ impl LanguageServer for Backend {
             state.documents.insert(uri.clone(), Document { text: Arc::from(change.text), version: params.text_document.version, rust });
         }
         self.check(vec![uri.clone()]).await;
-        self.type_check(uri).await;
+        self.schedule_type_check(uri);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        self.lock().documents.remove(&uri);
+        {
+            let mut state = self.lock();
+            state.documents.remove(&uri);
+            state.checked.remove(&uri);
+            state.type_errors.remove(&uri);
+            if let Some(type_check) = state.type_checks.remove(&uri) {
+                type_check.abort();
+            }
+        }
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
@@ -270,11 +358,29 @@ impl LanguageServer for Backend {
         let open = {
             let mut state = self.lock();
             for change in params.changes {
-                if let Some(root) = change.uri.to_file_path().and_then(|path| path.parent().map(Path::to_path_buf)) {
-                    state.configs.remove(&root);
-                }
-                if change.typ == FileChangeType::DELETED {
-                    cleared.push(change.uri);
+                let Some(path) = change.uri.to_file_path().map(std::borrow::Cow::into_owned) else {
+                    continue;
+                };
+                if path.file_name().is_some_and(|name| name == CONFIG_FILE_NAME) {
+                    // The configuration is read again, and its template directories watched again, on next use.
+                    if let Some(root) = path.parent() {
+                        state.configs.remove(root);
+                        state.file_caches.remove(root);
+                        state.watched_roots.remove(root);
+                    }
+                    if change.typ == FileChangeType::DELETED {
+                        cleared.push(change.uri);
+                    }
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    self.rust.lock().unwrap_or_else(PoisonError::into_inner).changed(&path);
+                } else {
+                    // A change in a template directory: everything known of that crate's templates may have changed.
+                    let State { configs, file_caches, .. } = &*state;
+                    for (root, cache) in file_caches {
+                        if configs.get(root).is_some_and(|config| config.dirs().iter().any(|dir| path.starts_with(dir))) {
+                            cache.lock().unwrap_or_else(PoisonError::into_inner).clear();
+                        }
+                    }
                 }
             }
             state.documents.keys().cloned().collect()
@@ -316,7 +422,7 @@ impl LanguageServer for Backend {
                 .positions
                 .iter()
                 .map(|&position| {
-                    let offset = structure.lines.offset(&structure.text, TextPosition { line: position.line, character: position.character });
+                    let offset = structure.lines.offset(&structure.text, text_position(position));
                     let chain = ranges::selection(&structure.text, &structure.tags, &structure.regions, offset);
                     // LSP wants the smallest range first, each pointing to the one around it.
                     let mut selection: Option<SelectionRange> = None;
@@ -376,7 +482,7 @@ impl LanguageServer for Backend {
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let position = &params.text_document_position_params;
-        let Some((used, range, crate_filters)) = self.filter_at(position) else {
+        let Some((used, range, facts)) = self.filter_at(position) else {
             if let Some(hover) = self.binding_hover(position) {
                 return Ok(Some(hover));
             }
@@ -395,13 +501,14 @@ impl LanguageServer for Backend {
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n---\n\n");
-                Hover { contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value }), range: Some(range) }
+                markdown_hover(value, Some(range))
             }));
         };
-        let text = if let Some(custom) = crate_filters.find(&used.name).filter(|_| !used.qualified) {
+        let text = if let Some(custom) = facts.filters.find(&used.name).filter(|_| !used.qualified) {
             let mut text = format!("```rust\n{}\n```", custom.signature);
             if !custom.docs.is_empty() {
-                text.push_str(&format!("\n\n{}", custom.docs));
+                text.push_str("\n\n");
+                text.push_str(&custom.docs);
             }
             text
         } else if let Some(builtin) = filters::builtin(&used.name).filter(|_| !used.qualified) {
@@ -409,24 +516,26 @@ impl LanguageServer for Backend {
         } else {
             return Ok(None);
         };
-        Ok(Some(Hover { contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: text }), range: Some(range) }))
+        Ok(Some(markdown_hover(text, Some(range))))
     }
 
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
         let uri = &params.text_document.uri;
-        let Some(file) = uri.to_file_path().map(|path| path.into_owned()) else {
+        let Some(file) = uri.to_file_path().map(std::borrow::Cow::into_owned) else {
             return Ok(None);
         };
-        let mut state = self.lock();
-        if !state.documents.get(uri).is_some_and(|document| document.rust) {
-            return Ok(None);
-        }
-        let Ok(disk) = std::fs::read_to_string(&file) else {
+        let config = {
+            let mut state = self.lock();
+            if !state.documents.get(uri).is_some_and(|document| document.rust) {
+                return Ok(None);
+            }
+            state.config_for(uri, &mut Vec::new())
+        };
+        let Some(disk) = project::read_text(&file) else {
             return Ok(None);
         };
         let lines = LineIndex::new(&disk);
-        let config = state.config_for(uri, &mut Vec::new());
-        let facts = state.crate_facts(uri);
+        let facts = self.facts(uri);
         let lenses = facts
             .structs
             .iter()
@@ -494,20 +603,12 @@ impl LanguageServer for Backend {
 
     async fn symbol(&self, params: WorkspaceSymbolParams) -> Result<Option<WorkspaceSymbolResponse>> {
         let query = params.query.to_lowercase();
-        let roots = {
-            let state = self.lock();
-            let mut roots: Vec<PathBuf> = state.folders.iter().flat_map(|folder| project::crates_under(folder)).collect();
-            roots.extend(state.configs.keys().cloned());
-            roots.sort();
-            roots.dedup();
-            roots
-        };
         let mut symbols = Vec::new();
-        for root in roots {
+        for root in self.crate_roots() {
             let config = self.lock().config(&root, &mut Vec::new());
-            let state = self.lock();
-            let read = |path: &Path| state.read(path);
-            for symbol in Project::new(&config, &read).symbols() {
+            let cache = self.file_cache(&root);
+            let read = |path: &Path| self.read_in(path, cache.as_deref());
+            for symbol in new_project(&config, &read, cache.as_deref()).symbols() {
                 if !is_subsequence(&query, &symbol.name.to_lowercase()) {
                     continue;
                 }
@@ -527,57 +628,158 @@ impl LanguageServer for Backend {
                 });
             }
         }
+        self.watch_template_dirs().await;
         Ok(Some(WorkspaceSymbolResponse::Nested(symbols)))
     }
 }
 
 /// An open template's text with its tags and regions, for the structural requests.
 struct Structure {
+    /// The template's text.
     text: Arc<str>,
+    /// The line index of `text`.
     lines: LineIndex,
+    /// Its tags.
     tags: Vec<tags::Tag>,
+    /// Its regions.
     regions: Vec<Region>,
+    /// The names it binds.
     bindings: Vec<Binding>,
 }
 
 impl Backend {
+    /// The shared state, locked. Every lock is short and never held across an `.await`; a panic while it was held does not stop the others
+    /// from using it.
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Asks the client to report changes to any `askama.toml`.
-    async fn watch_config_files(&self) {
-        let options = DidChangeWatchedFilesRegistrationOptions {
-            watchers: vec![FileSystemWatcher {
-                glob_pattern: GlobPattern::String(format!("**/{CONFIG_FILE_NAME}")),
-                kind: None,
-            }],
-        };
-        let Ok(register_options) = serde_json::to_value(options) else {
-            return;
-        };
-        let registration = Registration {
-            id: "askama-config-files".to_owned(),
-            method: "workspace/didChangeWatchedFiles".to_owned(),
-            register_options: Some(register_options),
-        };
-        if let Err(error) = self.client.register_capability(vec![registration]).await {
-            self.client
-                .log_message(MessageType::WARNING, format!("Could not watch {CONFIG_FILE_NAME} files: {error}"))
-                .await;
+    /// What the Rust code of the crate a document belongs to says.
+    fn facts(&self, uri: &Uri) -> Arc<CrateFacts> {
+        match uri.to_file_path().and_then(|path| project::crate_root(&path)) {
+            Some(root) => self.rust.lock().unwrap_or_else(PoisonError::into_inner).crate_facts(&root),
+            None => Arc::default(),
         }
     }
 
-    /// The completion items that need nothing but the server's own analysis, or the probe to
-    /// ask rust-analyzer when they need a type.
+    /// A template's text: the editor's, if it is open, otherwise the file's. The file is read without the state locked.
+    fn read(&self, path: &Path) -> Option<Arc<str>> {
+        self.read_in(path, None)
+    }
+
+    /// Like `read`, taking the file's text from `cache` when there is one, so a file is read from disk once until the cache is cleared.
+    fn read_in(&self, path: &Path, cache: Option<&Mutex<FileCache>>) -> Option<Arc<str>> {
+        let open = self.lock().open_text(path);
+        open.or_else(|| match cache {
+            Some(cache) => cache.lock().unwrap_or_else(PoisonError::into_inner).text(path),
+            None => project::read_text(path).map(Arc::from),
+        })
+    }
+
+    /// The file cache kept for the crate at `root`, if its template directories are watched (see `watch_template_dirs`).
+    fn file_cache(&self, root: &Path) -> Option<Arc<Mutex<FileCache>>> {
+        self.lock().file_caches.get(root).cloned()
+    }
+
+    /// An open template's text and its crate's configuration. `None` for a Rust file or a document the server does not have.
+    fn template(&self, uri: &Uri) -> Option<(Arc<str>, Arc<Config>)> {
+        let mut state = self.lock();
+        let text = state.template_text(uri)?;
+        // The configuration is normally cached by the check on open; diagnostics from reading it here would repeat that check's, so they
+        // are dropped.
+        Some((text, state.config_for(uri, &mut Vec::new())))
+    }
+
+    /// Every crate in the workspace folders and every crate with an open template. The folders are searched again only once
+    /// `CRATE_ROOTS_LIFETIME` has passed.
+    fn crate_roots(&self) -> Vec<PathBuf> {
+        let (folders, found, configured) = {
+            let state = self.lock();
+            let found = state.crate_roots.as_ref().filter(|(when, _)| when.elapsed() < CRATE_ROOTS_LIFETIME).map(|(_, roots)| roots.clone());
+            (state.folders.clone(), found, state.configs.keys().cloned().collect::<Vec<_>>())
+        };
+        let mut roots = found.unwrap_or_else(|| {
+            let roots: Vec<PathBuf> = folders.iter().flat_map(|folder| project::crates_under(folder)).collect();
+            self.lock().crate_roots = Some((Instant::now(), roots.clone()));
+            roots
+        });
+        roots.extend(configured);
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    /// Asks the client to report changes to any `askama.toml`. Asks the client to report changes to any `askama.toml` and any Rust file.
+    /// Once Rust files are watched, the Rust index trusts what it has read until a change is reported, rather than checking every file of
+    /// `src` on every request.
+    async fn watch_config_files(&self) {
+        let globs = [format!("**/{CONFIG_FILE_NAME}"), "**/*.rs".to_owned()];
+        let watchers = globs.into_iter().map(|glob| FileSystemWatcher { glob_pattern: GlobPattern::String(glob), kind: None }).collect();
+        match self.register_watchers("askama-files", watchers).await {
+            Ok(()) => self.rust.lock().unwrap_or_else(PoisonError::into_inner).set_watched(true),
+            Err(error) => {
+                self.client
+                    .log_message(MessageType::WARNING, format!("Could not watch {CONFIG_FILE_NAME} and Rust files: {error}"))
+                    .await;
+            }
+        }
+    }
+
+    /// Asks the client to watch the template directories of each crate whose configuration was read since the last call, and keeps a file
+    /// cache for each crate it watches. A crate is watched only if every one of its template directories exists: a watcher on a directory
+    /// that does not exist yet would miss the files made in it.
+    async fn watch_template_dirs(&self) {
+        if !self.can_watch_relative.load(Ordering::Relaxed) {
+            return;
+        }
+        let unwatched: Vec<(PathBuf, Vec<PathBuf>, usize)> = {
+            let mut state = self.lock();
+            let roots = std::mem::take(&mut state.unwatched_roots);
+            let mut found = Vec::new();
+            for root in roots {
+                if !state.watched_roots.insert(root.clone()) {
+                    continue;
+                }
+                if let Some(config) = state.configs.get(&root) {
+                    let dirs = config.dirs().to_vec();
+                    state.registrations += 1;
+                    found.push((root, dirs, state.registrations));
+                }
+            }
+            found
+        };
+        for (root, dirs, number) in unwatched {
+            if dirs.is_empty() || !dirs.iter().all(|dir| dir.is_dir()) {
+                continue;
+            }
+            let watchers = dirs
+                .iter()
+                .filter_map(|dir| {
+                    let base_uri = Uri::from_file_path(dir)?;
+                    Some(FileSystemWatcher { glob_pattern: GlobPattern::Relative(RelativePattern { base_uri: OneOf::Right(base_uri), pattern: "**/*".to_owned() }), kind: None })
+                })
+                .collect();
+            if self.register_watchers(&format!("askama-templates-{number}"), watchers).await.is_ok() {
+                self.lock().file_caches.insert(root, Arc::default());
+            }
+        }
+    }
+
+    /// Registers file watchers with the client under the registration id `id`.
+    async fn register_watchers(&self, id: &str, watchers: Vec<FileSystemWatcher>) -> std::result::Result<(), String> {
+        let options = DidChangeWatchedFilesRegistrationOptions { watchers };
+        let register_options = serde_json::to_value(options).map_err(|error| error.to_string())?;
+        let registration = Registration { id: id.to_owned(), method: "workspace/didChangeWatchedFiles".to_owned(), register_options: Some(register_options) };
+        self.client.register_capability(vec![registration]).await.map_err(|error| error.to_string())
+    }
+
+    /// The completion items that need nothing but the server's own analysis, or the probe to ask rust-analyzer when they need a type.
     fn completion_step(&self, params: &CompletionParams) -> CompletionStep {
         let position = &params.text_document_position;
         let uri = &position.text_document.uri;
-        let mut state = self.lock();
-        let Some(text) = state.template_text(uri) else {
+        let Some((text, config)) = self.template(uri) else {
             return CompletionStep::Done(None);
         };
-        let config = state.config_for(uri, &mut Vec::new());
         let lines = LineIndex::new(&text);
         let offset = lines.offset(&text, text_position(position.position));
         let after_space = params.context.as_ref().and_then(|context| context.trigger_character.as_deref()) == Some(" ");
@@ -589,119 +791,102 @@ impl Backend {
         let Some(found) = found else {
             return CompletionStep::Done(None);
         };
+        let cursor = Cursor { uri, config: &config, text: &text, offset };
         let items = match found {
-            Completion::Filter { replace } => {
-                let range = to_range(&text, &lines, replace);
-                let custom = state.crate_facts(uri).filters.filters.into_iter().map(|filter| CompletionItem {
-                    detail: Some(filter.signature.clone()),
-                    documentation: Some(markdown(filter.docs.clone())),
-                    sort_text: Some(format!("0{}", filter.name)),
-                    ..item(&filter.name, CompletionItemKind::FUNCTION, range)
-                });
-                let builtins = BUILTINS.iter().map(|builtin| CompletionItem {
-                    detail: Some(format!("{} (Askama)", builtin.usage)),
-                    documentation: Some(markdown(builtin.description.to_owned())),
-                    sort_text: Some(format!("1{}", builtin.name)),
-                    ..item(builtin.name, CompletionItemKind::FUNCTION, range)
-                });
-                custom.chain(builtins).collect()
-            }
-            Completion::Variable { replace } => {
-                let range = to_range(&text, &lines, replace);
-                let facts = state.crate_facts(uri);
-                let Some(file) = uri.to_file_path() else {
-                    return CompletionStep::Done(None);
-                };
-                let state = &*state;
-                let read = |path: &Path| state.read(path);
-                let structs = Project::new(&config, &read).structs_for(&file, &facts.structs);
-                let tags = tags::scan(&text, &config.default_syntax());
-                let bindings = scopes::bindings(&text, &tags, &outline::regions(&text, &tags));
-                let mut items: Vec<CompletionItem> = scopes::visible_at(&bindings, offset)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(depth, binding)| CompletionItem {
-                        detail: Some(binding_summary(binding)),
-                        sort_text: Some(format!("0{depth:03}{}", binding.name)),
-                        ..item(&binding.name, CompletionItemKind::VARIABLE, range)
-                    })
-                    .collect();
-                for template_struct in &structs {
-                    for member in &template_struct.members {
-                        if items.iter().any(|item| item.label == member.name) {
-                            continue;
-                        }
-                        let owners: Vec<&str> = structs.iter().filter(|other| other.member(&member.name).is_some()).map(|other| other.name.as_str()).collect();
-                        let detail = if owners.len() == structs.len() { member.detail.clone() } else { format!("{} (only in {})", member.detail, owners.join(", ")) };
-                        let kind = match member.kind {
-                            MemberKind::Field => CompletionItemKind::FIELD,
-                            MemberKind::Method => CompletionItemKind::METHOD,
-                        };
-                        items.push(CompletionItem {
-                            detail: Some(detail),
-                            documentation: Some(markdown(member_docs(member, &owners))),
-                            sort_text: Some(format!("{}{}", if owners.len() == structs.len() { 1 } else { 2 }, member.name)),
-                            ..item(&member.name, kind, range)
-                        });
-                    }
-                }
-                items
-            }
-            Completion::Member { object, replace } => {
+            Completion::Filter { replace } => Some(self.filter_items(uri, to_range(&text, &lines, replace))),
+            Completion::Variable { replace } => self.variable_items(&cursor, to_range(&text, &lines, replace)),
+            Completion::Member { object, object_range, replace } => {
                 let range = to_range(&text, &lines, replace.clone());
                 let tags = tags::scan(&text, &config.default_syntax());
                 let bindings = scopes::bindings(&text, &tags, &outline::regions(&text, &tags));
-                let visible = scopes::visible_at(&bindings, offset);
-                let in_loop = visible.iter().any(|binding| binding.kind == BindingKind::Loop && binding.name == object);
+                let in_loop = scopes::visible_at(&bindings, offset).iter().any(|binding| binding.kind == BindingKind::Loop && binding.name == object);
                 if !in_loop {
-                    let typed = text[replace.clone()].to_owned();
-                    return self.completion_probe(&mut state, uri, &config, &text, offset, &object, &typed, range).map_or(CompletionStep::Done(None), CompletionStep::Probe);
+                    return self.completion_probe(&cursor, object_range, &text[replace], range).map_or(CompletionStep::Done(None), CompletionStep::Probe);
                 }
-                LOOP_MEMBERS
-                    .iter()
-                    .map(|&(name, description)| CompletionItem {
-                        documentation: Some(markdown(description.to_owned())),
-                        ..item(name, if name == "cycle" { CompletionItemKind::METHOD } else { CompletionItemKind::PROPERTY }, range)
-                    })
-                    .collect()
+                Some(loop_items(range))
             }
-            Completion::Keyword { replace, closer } => {
-                let range = to_range(&text, &lines, replace);
-                KEYWORDS
-                    .iter()
-                    .map(|&keyword| {
-                        let first = closer == Some(keyword);
-                        CompletionItem {
-                            sort_text: Some(format!("{}{keyword}", if first { 0 } else { 1 })),
-                            preselect: first.then_some(true),
-                            detail: first.then(|| "closes the innermost open tag".to_owned()),
-                            ..item(keyword, CompletionItemKind::KEYWORD, range)
-                        }
-                    })
-                    .collect()
-            }
+            Completion::Keyword { replace, closer } => Some(keyword_items(closer, to_range(&text, &lines, replace))),
         };
-        CompletionStep::Done(Some(items))
+        CompletionStep::Done(items)
     }
 
-    /// Where a probe for a template position comes from: the struct whose file it goes in, the
-    /// statements that bring the template's names into scope there, and whether `first` (the
-    /// first name of the path asked about) is one of those names rather than a struct member.
+    /// The crate's custom filters, then Askama's built-in ones.
+    fn filter_items(&self, uri: &Uri, range: Range) -> Vec<CompletionItem> {
+        let facts = self.facts(uri);
+        let custom = facts.filters.filters.iter().map(|filter| CompletionItem {
+            detail: Some(filter.signature.clone()),
+            documentation: Some(markdown(filter.docs.clone())),
+            sort_text: Some(format!("0{}", filter.name)),
+            ..item(&filter.name, CompletionItemKind::FUNCTION, range)
+        });
+        let builtins = BUILTINS.iter().map(|builtin| CompletionItem {
+            detail: Some(format!("{} (Askama)", builtin.usage)),
+            documentation: Some(markdown(builtin.description.to_owned())),
+            sort_text: Some(format!("1{}", builtin.name)),
+            ..item(builtin.name, CompletionItemKind::FUNCTION, range)
+        });
+        custom.chain(builtins).collect()
+    }
+
+    /// The names the template binds visible at the cursor, nearest first, then the members of its structs. A member only some of the
+    /// structs have comes after the others.
+    fn variable_items(&self, cursor: &Cursor<'_>, range: Range) -> Option<Vec<CompletionItem>> {
+        let file = cursor.uri.to_file_path()?;
+        let facts = self.facts(cursor.uri);
+        let cache = project::crate_root(&file).and_then(|root| self.file_cache(&root));
+        let read = |path: &Path| self.read_in(path, cache.as_deref());
+        let structs = new_project(cursor.config, &read, cache.as_deref()).structs_for(&file, &facts.structs);
+        let tags = tags::scan(cursor.text, &cursor.config.default_syntax());
+        let bindings = scopes::bindings(cursor.text, &tags, &outline::regions(cursor.text, &tags));
+        let mut items: Vec<CompletionItem> = scopes::visible_at(&bindings, cursor.offset)
+            .into_iter()
+            .enumerate()
+            .map(|(depth, binding)| CompletionItem {
+                detail: Some(binding_summary(binding)),
+                sort_text: Some(format!("0{depth:03}{}", binding.name)),
+                ..item(&binding.name, CompletionItemKind::VARIABLE, range)
+            })
+            .collect();
+        for template_struct in &structs {
+            for member in &template_struct.members {
+                if items.iter().any(|item| item.label == member.name) {
+                    continue;
+                }
+                let owners: Vec<&str> = structs.iter().filter(|other| other.member(&member.name).is_some()).map(|other| other.name.as_str()).collect();
+                let everywhere = owners.len() == structs.len();
+                let detail = if everywhere { member.detail.clone() } else { format!("{} (only in {})", member.detail, owners.join(", ")) };
+                let kind = match member.kind {
+                    MemberKind::Field => CompletionItemKind::FIELD,
+                    MemberKind::Method => CompletionItemKind::METHOD,
+                };
+                items.push(CompletionItem {
+                    detail: Some(detail),
+                    documentation: Some(markdown(member_docs(member, &owners))),
+                    sort_text: Some(format!("{}{}", if everywhere { 1 } else { 2 }, member.name)),
+                    ..item(&member.name, kind, range)
+                });
+            }
+        }
+        Some(items)
+    }
+
+    /// Where a probe for a template position comes from: the struct whose file it goes in, the statements that bring the template's names
+    /// into scope there, and whether `first` (the first name of the path asked about) is one of those names rather than a struct member.
     ///
-    /// The statements are the template's loops, `let`s and patterns around `offset`, as Askama
-    /// writes them. Inside a macro, whose arguments get their values where it is called, they
-    /// start from the one place that calls it (none if there are several) and pass the
+    /// The statements are the template's loops, `let`s and patterns around the cursor, as Askama writes them. Inside a macro, whose
+    /// arguments get their values where it is called, they start from the one place that calls it (none if there are several) and pass the
     /// arguments as Askama does. `None` if any of it cannot be written in Rust.
-    fn probe_scope(&self, state: &mut State, uri: &Uri, config: &Config, text: &str, offset: usize, first: &str) -> Option<ProbeScope> {
-        if !state.type_completion {
+    fn probe_scope(&self, cursor: &Cursor<'_>, first: &str, expressions: &[ByteRange<usize>]) -> Option<ProbeScope> {
+        if !self.lock().type_completion {
             return None;
         }
+        let Cursor { uri, config, text, offset } = *cursor;
         let file = uri.to_file_path()?.into_owned();
         let root = project::crate_root(&file)?;
-        let facts = state.crate_facts(uri);
-        let state = &*state;
-        let read = |path: &Path| state.read(path);
-        let project = Project::new(config, &read);
+        let facts = self.facts(uri);
+        let cache = self.file_cache(&root);
+        let read = |path: &Path| self.read_in(path, cache.as_deref());
+        let project = new_project(config, &read, cache.as_deref());
         let syntax = config.default_syntax();
 
         let tags = tags::scan(text, &syntax);
@@ -712,7 +897,8 @@ impl Backend {
             .filter(|region| region.kind == RegionKind::Macro && region.opener.end <= offset && region.closer.as_ref().is_none_or(|closer| offset <= closer.start))
             .min_by_key(|region| region.range.len());
 
-        let (template_struct, setup) = match macro_body {
+        let lower = |template: &Template<'_>| expressions.iter().map(|range| template.expression(range.clone(), range.start)).collect::<Option<Vec<_>>>();
+        let (template_struct, setup, lowered) = match macro_body {
             Some(macro_region) if local => {
                 let name = macro_region.label.strip_prefix("macro")?.trim().split(|c: char| !(c.is_alphanumeric() || c == '_')).next()?.to_owned();
                 let mut parameters: Vec<&Binding> = bindings
@@ -733,14 +919,15 @@ impl Backend {
                 let site_regions = outline::regions(&site_text, &site_tags);
                 let site_bindings = scopes::bindings(&site_text, &site_tags, &site_regions);
                 let site = Template { source: &site_text, tags: &site_tags, regions: &site_regions, bindings: &site_bindings, is_member: &is_member };
-                let call = site_tags.iter().find(|tag| tag.range == call_range)?;
+                let call = tags::starting_at(&site_tags, call_range.start)?;
                 let mut setup = site.setup(call_range.start, 0)?;
-                setup.extend(site.macro_arguments(lowering::call_arguments(&site_text, call)?, &parameters)?);
+                setup.extend(&site.macro_arguments(lowering::call_arguments(&site_text, call)?, &parameters)?);
                 // A macro's body sees its arguments and its own names, not the struct's.
                 let no_members = |_: &str| false;
                 let body = Template { source: text, tags: &tags, regions: &regions, bindings: &bindings, is_member: &no_members };
-                setup.extend(body.setup(offset, macro_region.opener.end)?);
-                (template_struct, setup)
+                setup.extend(&body.setup(offset, macro_region.opener.end)?);
+                let lowered = lower(&body)?;
+                (template_struct, setup, lowered)
             }
             Some(_) => return None,
             None => {
@@ -750,56 +937,56 @@ impl Backend {
                 let is_member = |name: &str| template_struct.member(name).is_some();
                 let here = Template { source: text, tags: &tags, regions: &regions, bindings: &bindings, is_member: &is_member };
                 let setup = here.setup(offset, 0)?;
-                (template_struct, setup)
+                let lowered = lower(&here)?;
+                (template_struct, setup, lowered)
             }
         };
         // The struct's file as on disk, where the index found the struct.
-        let rust_text = std::fs::read_to_string(&template_struct.file).ok()?;
-        Some(ProbeScope { root, template_struct, setup, local, rust_text })
+        let rust_text = project::read_text(&template_struct.file)?;
+        Some(ProbeScope { root, template_struct, setup, lowered, rust_text })
     }
 
-    /// The probe for the members of `path`, a dotted path whose members are being completed.
-    #[expect(clippy::too_many_arguments, reason = "one call site, every argument a different piece of the request")]
-    fn completion_probe(&self, state: &mut State, uri: &Uri, config: &Config, text: &str, offset: usize, path: &str, typed: &str, range: Range) -> Option<ProbePlan> {
-        let scope = self.probe_scope(state, uri, config, text, offset, path.split('.').next()?)?;
-        let expression = if scope.local { path.to_owned() } else { format!("self.{path}") };
-        let probe = probe::members_in(&scope.rust_text, &scope.template_struct, &scope.setup, &expression, typed);
+    /// The probe for the members of the chain at `object` (`order.customer`, `order.items.first()`), with `typed` the part of the member's
+    /// name typed so far. The chain is lowered as any expression is, so names in a call's arguments are the struct's or the template's as
+    /// they are elsewhere.
+    fn completion_probe(&self, cursor: &Cursor<'_>, object: ByteRange<usize>, typed: &str, range: Range) -> Option<ProbePlan> {
+        let first = cursor.text[object.clone()].split(|c: char| !(c.is_alphanumeric() || c == '_')).next()?;
+        let scope = self.probe_scope(cursor, first, std::slice::from_ref(&object))?;
+        let probe = probe::members_in(&scope.rust_text, &scope.template_struct, &scope.setup, &scope.lowered[0], typed);
         Some(ProbePlan { root: scope.root, file: scope.template_struct.file, text: probe.text, position: probe.position, range })
     }
 
-    /// For the name at a position that follows a `.` in an expression (`customer` in
-    /// `order.customer.name`): the probe whose position is that name in Rust, and its range in
-    /// the template.
+    /// For the name at a position that follows a `.` in an expression (`customer` in `order.customer.name`): the probe whose position is
+    /// that name in Rust, and its range in the template.
     fn path_probe(&self, position: &TextDocumentPositionParams) -> Option<PathProbe> {
         let uri = &position.text_document.uri;
-        let mut state = self.lock();
-        let text = state.template_text(uri)?;
-        let config = state.config_for(uri, &mut Vec::new());
+        let (text, config) = self.template(uri)?;
         let lines = LineIndex::new(&text);
         let offset = lines.offset(&text, text_position(position.position));
         let tags = tags::scan(&text, &config.default_syntax());
-        let tag = tags.iter().find(|tag| matches!(tag.kind, tags::TagKind::Expr | tags::TagKind::Block) && tag.inner.start <= offset && offset <= tag.inner.end)?;
+        let tag = tags::containing(&tags, offset).filter(|tag| matches!(tag.kind, tags::TagKind::Expr | tags::TagKind::Block) && tag.inner.start <= offset && offset <= tag.inner.end)?;
         let is_word = |c: char| c.is_alphanumeric() || c == '_';
-        let start = text[..offset].trim_end_matches(is_word).len();
-        let end = offset + text[offset..tag.inner.end].find(|c: char| !is_word(c)).unwrap_or(tag.inner.end - offset);
-        if start == end || !text[..start].ends_with('.') || text[..start].ends_with("..") {
+        let start = text.get(..offset)?.trim_end_matches(is_word).len().max(tag.inner.start);
+        let end = offset + text.get(offset..tag.inner.end)?.find(|c: char| !is_word(c)).unwrap_or(tag.inner.end - offset);
+        let before = &text[..start];
+        if start == end || !before.ends_with('.') || before.ends_with("..") {
             return None;
         }
-        let chain_start = text[tag.inner.start..start].trim_end_matches(|c: char| is_word(c) || c == '.').len() + tag.inner.start;
-        let path = &text[chain_start..end];
-        if path.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        // The chain before the name, which may hold calls and indexing (`order.items.first().name`).
+        let chain_start = askama_analysis::text::chain_start(&text, start).max(tag.inner.start);
+        if chain_start == start {
             return None;
         }
-        let scope = self.probe_scope(&mut state, uri, &config, &text, offset, path.split('.').next()?)?;
-        let prefix = if scope.local { "" } else { "self." };
-        let line = format!("let _ = &({prefix}{path});");
-        let cursor = "let _ = &(".len() + prefix.len() + (start - chain_start);
+        let first = text[chain_start..start].split(|c: char| !is_word(c)).next()?;
+        // The chain is lowered up to the name and through it; the first gives the name's place in the second.
+        let scope = self.probe_scope(&Cursor { uri, config: &config, text: &text, offset }, first, &[chain_start..start, chain_start..end])?;
+        let line = format!("{TYPE_PROBE_PREFIX}{});", scope.lowered[1]);
+        let cursor = TYPE_PROBE_PREFIX.len() + scope.lowered[0].len();
         let probe = probe::at(&scope.rust_text, &scope.template_struct, &scope.setup, &line, cursor);
         Some(PathProbe { root: scope.root, file: scope.template_struct.file, probe, range: to_range(&text, &lines, start..end) })
     }
 
-    /// Asks the crate's rust-analyzer about a probe and turns its answers into completion
-    /// items for the template.
+    /// Asks the crate's rust-analyzer about a probe and turns its answers into completion items for the template.
     async fn probe_members(&self, plan: ProbePlan) -> Option<Vec<CompletionItem>> {
         let analyzer = self.ready_analyzer(&plan.root).await?;
         let uri = Uri::from_file_path(&plan.file)?;
@@ -812,13 +999,13 @@ impl Backend {
         let plan = self.path_probe(position)?;
         let analyzer = self.ready_analyzer(&plan.root).await?;
         let uri = Uri::from_file_path(&plan.file)?;
-        let hover = analyzer.hover(uri.as_str(), &plan.probe.text, plan.probe.position.line, plan.probe.position.character).await?;
-        let contents = serde_json::from_value::<HoverContents>(hover.get("contents")?.clone()).ok()?;
+        let mut hover = analyzer.hover(uri.as_str(), &plan.probe.text, plan.probe.position.line, plan.probe.position.character).await?;
+        let contents = serde_json::from_value::<HoverContents>(hover.get_mut("contents")?.take()).ok()?;
         Some(Hover { contents, range: Some(plan.range) })
     }
 
-    /// Where the name at a position that follows a `.` is defined, by rust-analyzer. A place in
-    /// the probed file is moved back to where it is on disk.
+    /// Where the name at a position that follows a `.` is defined, by rust-analyzer. A place in the probed file is moved back to where it
+    /// is on disk.
     async fn path_definition(&self, position: &TextDocumentPositionParams) -> Option<Location> {
         let plan = self.path_probe(position)?;
         let analyzer = self.ready_analyzer(&plan.root).await?;
@@ -832,18 +1019,30 @@ impl Backend {
         Some(location)
     }
 
-    /// The type errors of a template, from rust-analyzer, published with the check's own
-    /// diagnostics. Only once the crate's rust-analyzer is running and ready (opening a
-    /// template never starts it), only where unknown variables are checked, and only when the
-    /// template has no syntax error. A burst of edits gets one type check, after it.
+    /// Type checks a template a moment from now, in a task of its own, so the edit that asked for it is answered at once. A newer edit
+    /// cancels it, so a burst of edits gets one type check, after it.
+    fn schedule_type_check(&self, uri: Uri) {
+        let backend = self.clone();
+        let task = tokio::spawn({
+            let uri = uri.clone();
+            async move {
+                tokio::time::sleep(TYPE_CHECK_DELAY).await;
+                backend.type_check(uri).await;
+            }
+        });
+        let previous = self.lock().type_checks.insert(uri, task.abort_handle());
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+    }
+
+    /// The type errors of a template, from rust-analyzer, published with the check's own diagnostics. Only once the crate's rust-analyzer
+    /// is running and ready (opening a template never starts it), only where unknown variables are checked, and only when the template has
+    /// no syntax error.
     async fn type_check(&self, uri: Uri) {
-        tokio::time::sleep(Duration::from_millis(250)).await;
         let Some(plan) = self.type_probe(&uri) else {
             return;
         };
-        if !plan.analyzer.wait_ready(Duration::ZERO).await {
-            return;
-        }
         let Some(file_uri) = Uri::from_file_path(&plan.file) else {
             return;
         };
@@ -888,38 +1087,44 @@ impl Backend {
         }
     }
 
-    /// A probe with one block per expression of a template, or `None` when it should not be
-    /// type checked (see `type_check`).
+    /// A probe with one block per expression of a template, or `None` when it should not be type checked (see `type_check`).
     fn type_probe(&self, uri: &Uri) -> Option<TypeProbe> {
-        let mut state = self.lock();
-        if !state.type_completion {
-            return None;
-        }
-        let document = state.documents.get(uri).filter(|document| !document.rust)?;
-        let (text, version) = (Arc::clone(&document.text), document.version);
-        let (_, checked) = state.checked.get(uri).filter(|(checked, _)| *checked == version)?;
-        if checked.iter().any(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)) {
-            return None;
-        }
         let file = uri.to_file_path()?.into_owned();
         let root = project::crate_root(&file)?;
-        let analyzer = state.analyzers.get(&root).and_then(|cell| cell.get().cloned().flatten())?;
-        let config = state.config_for(uri, &mut Vec::new());
-        let facts = state.crate_facts(uri);
-        let state = &*state;
-        let read = |path: &Path| state.read(path);
-        let project = Project::new(&config, &read);
+        let (text, version, analyzer, config) = {
+            let mut state = self.lock();
+            if !state.type_completion {
+                return None;
+            }
+            let document = state.documents.get(uri).filter(|document| !document.rust)?;
+            let (text, version) = (Arc::clone(&document.text), document.version);
+            let (_, checked) = state.checked.get(uri).filter(|(checked, _)| *checked == version)?;
+            if checked.iter().any(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)) {
+                return None;
+            }
+            let analyzer = state.analyzers.get(&root).and_then(|cell| cell.get().cloned().flatten())?;
+            (text, version, analyzer, state.config_for(uri, &mut Vec::new()))
+        };
+        if !analyzer.is_ready() {
+            return None;
+        }
+        let facts = self.facts(uri);
+        let cache = self.file_cache(&root);
+        let read = |path: &Path| self.read_in(path, cache.as_deref());
+        let project = new_project(&config, &read, cache.as_deref());
         let structs = project.structs_for(&file, &facts.structs);
         if structs.is_empty() || !project.sees_only_struct_names(&file, &structs) {
             return None;
         }
-        let template_struct = structs[0].clone();
+        let template_struct = structs[0];
         let tags = tags::scan(&text, &config.default_syntax());
         let regions = outline::regions(&text, &tags);
         let bindings = scopes::bindings(&text, &tags, &regions);
         let is_member = |name: &str| template_struct.member(name).is_some();
         let template = Template { source: &text, tags: &tags, regions: &regions, bindings: &bindings, is_member: &is_member };
-        let in_macro = |at: usize| Region::walk(&regions).any(|region| region.kind == RegionKind::Macro && region.range.contains(&at));
+        let macros: Vec<&ByteRange<usize>> = Region::walk(&regions).filter(|region| region.kind == RegionKind::Macro).map(|region| &region.range).collect();
+        // A call block's caller parameters get their values inside the macro, so their types are not known here.
+        let caller_bodies: Vec<&ByteRange<usize>> = bindings.iter().filter(|binding| binding.kind == BindingKind::CallerArgument).map(|binding| &binding.scope).collect();
 
         let mut blocks = Vec::new();
         let mut mapped_blocks = Vec::new();
@@ -929,7 +1134,8 @@ impl Backend {
             };
             // `loop` is a Rust keyword, and its members are Askama's, not a type's.
             let mentions_loop = text[range.clone()].split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|word| word == "loop");
-            if text[range.clone()].trim().is_empty() || in_macro(range.start) || mentions_loop {
+            let in_macro = macros.iter().chain(&caller_bodies).any(|macro_range| macro_range.contains(&range.start));
+            if text[range.clone()].trim().is_empty() || in_macro || mentions_loop {
                 continue;
             }
             let (Some(mapped), Some(setup)) = (template.mapped_expression(range.clone(), range.start), template.setup(range.start, 0)) else {
@@ -941,11 +1147,11 @@ impl Backend {
         if blocks.is_empty() {
             return None;
         }
-        let rust_text = std::fs::read_to_string(&template_struct.file).ok()?;
-        let (probe_text, lines) = probe::with_blocks(&rust_text, &template_struct, &blocks);
+        let rust_text = project::read_text(&template_struct.file)?;
+        let (probe_text, lines) = probe::with_blocks(&rust_text, template_struct, &blocks);
         Some(TypeProbe {
             analyzer,
-            file: template_struct.file,
+            file: Arc::clone(&template_struct.file),
             text: probe_text,
             version,
             template_text: text,
@@ -953,27 +1159,29 @@ impl Backend {
         })
     }
 
-    /// The crate's rust-analyzer once it has loaded the crate, waiting for that briefly: the
-    /// editor asks again as the user types, and the progress shown says when it is ready.
+    /// The crate's rust-analyzer once it has loaded the crate, waiting for that briefly: the editor asks again as the user types, and the
+    /// progress shown says when it is ready.
     async fn ready_analyzer(&self, root: &Path) -> Option<Arc<Analyzer>> {
         let analyzer = self.analyzer(root).await?;
         analyzer.wait_ready(Duration::from_secs(3)).await.then_some(analyzer)
     }
 
-    /// The crate's rust-analyzer, started on first use. `None` if it cannot start, which is
-    /// reported once.
+    /// The crate's rust-analyzer, started on first use and stopped once idle for `ANALYZER_IDLE_LIMIT` (see `stop_when_idle`); the next use
+    /// starts it again. `None` if it cannot start, which is reported once; a server restart tries again.
     async fn analyzer(&self, root: &Path) -> Option<Arc<Analyzer>> {
-        let (cell, program, progress) = {
+        let (cell, program, progress, permissions) = {
             let mut state = self.lock();
             let cell = Arc::clone(state.analyzers.entry(root.to_path_buf()).or_default());
-            (cell, state.rust_analyzer.clone(), state.can_show_progress)
+            (cell, state.rust_analyzer.clone(), state.can_show_progress, state.permissions)
         };
         cell.get_or_init(|| async {
-            match Analyzer::start(&program, root).await {
+            match Analyzer::start(&program, root, permissions).await {
                 Ok(analyzer) => {
                     if progress {
-                        self.show_loading(root, Arc::clone(&analyzer)).await;
+                        // In a task of its own: it waits on the client, which must not hold up the requests that wait for this analyzer.
+                        tokio::spawn(show_loading(self.client.clone(), root.to_path_buf(), Arc::clone(&analyzer)));
                     }
+                    tokio::spawn(stop_when_idle(self.clone(), root.to_path_buf(), Arc::downgrade(&analyzer)));
                     Some(analyzer)
                 }
                 Err(error) => {
@@ -987,29 +1195,9 @@ impl Backend {
         .clone()
     }
 
-    /// Shows progress in the editor until rust-analyzer has loaded the crate.
-    async fn show_loading(&self, root: &Path, analyzer: Arc<Analyzer>) {
-        let token = NumberOrString::String(format!("askama-rust-analyzer:{}", root.display()));
-        if self.client.create_work_done_progress(token.clone()).await.is_err() {
-            return;
-        }
-        let progress = self.client.progress(token, "Askama").with_message("rust-analyzer is loading the crate").begin().await;
-        tokio::spawn(async move {
-            let ready = analyzer.wait_ready(Duration::from_secs(600)).await;
-            progress.finish_with_message(if ready { "rust-analyzer is ready" } else { "rust-analyzer is still loading" }).await;
-        });
-    }
-
-    /// Runs `answer` on the structure of an open template, scanned with its crate's syntax.
-    /// `None` for a document the server does not have.
+    /// Runs `answer` on the structure of an open template, scanned with its crate's syntax. `None` for a document the server does not have.
     fn with_structure<T>(&self, uri: &Uri, answer: impl FnOnce(Structure) -> T) -> Option<T> {
-        let (text, config) = {
-            let mut state = self.lock();
-            let text = state.template_text(uri)?;
-            // The configuration is normally cached by the check on open; diagnostics from
-            // reading it here would repeat that check's, so they are dropped.
-            (text, state.config_for(uri, &mut Vec::new()))
-        };
+        let (text, config) = self.template(uri)?;
         let tags = tags::scan(&text, &config.default_syntax());
         let regions = outline::regions(&text, &tags);
         let bindings = scopes::bindings(&text, &tags, &regions);
@@ -1017,37 +1205,33 @@ impl Backend {
         Some(answer(Structure { text, lines, tags, regions, bindings }))
     }
 
-    /// Runs `answer` with the project an open template belongs to, the template's path and
-    /// its text. `None` for a document the server does not have or that is not a file.
+    /// Runs `answer` with the project an open template belongs to, the template's path and its text. `None` for a document the server does
+    /// not have or that is not a file.
     fn with_project<T>(&self, uri: &Uri, answer: impl FnOnce(&Project<'_>, &Path, &Arc<str>) -> T) -> Option<T> {
         let file = uri.to_file_path()?.into_owned();
-        let mut state = self.lock();
-        let text = state.template_text(uri)?;
-        let config = state.config_for(uri, &mut Vec::new());
-        let state = &*state;
-        let read = |path: &Path| state.read(path);
-        Some(answer(&Project::new(&config, &read), &file, &text))
+        let (text, config) = self.template(uri)?;
+        let cache = project::crate_root(&file).and_then(|root| self.file_cache(&root));
+        let read = |path: &Path| self.read_in(path, cache.as_deref());
+        Some(answer(&new_project(&config, &read, cache.as_deref()), &file, &text))
     }
 
-    /// The filter applied at a position, its range, and the crate's custom filters.
-    fn filter_at(&self, position: &TextDocumentPositionParams) -> Option<(FilterUse, Range, CrateFilters)> {
+    /// The filter applied at a position, its range, and the crate's facts for its filters.
+    fn filter_at(&self, position: &TextDocumentPositionParams) -> Option<(FilterUse, Range, Arc<CrateFacts>)> {
         let uri = &position.text_document.uri;
-        let mut state = self.lock();
-        let text = state.template_text(uri)?;
-        let config = state.config_for(uri, &mut Vec::new());
+        let (text, config) = self.template(uri)?;
         let lines = LineIndex::new(&text);
         let offset = lines.offset(&text, text_position(position.position));
         let tags = tags::scan(&text, &config.default_syntax());
         let used = filters::filter_uses(&text, &tags).into_iter().find(|used| used.range.start <= offset && offset <= used.range.end)?;
         let range = to_range(&text, &lines, used.range.clone());
-        Some((used, range, state.crate_facts(uri).filters))
+        Some((used, range, self.facts(uri)))
     }
 
     /// Where the custom filter applied at a position is defined.
     fn filter_definition(&self, position: &TextDocumentPositionParams) -> Option<Location> {
-        let (used, _, crate_filters) = self.filter_at(position)?;
-        let custom = crate_filters.find(&used.name).filter(|_| !used.qualified)?;
-        let text: Arc<str> = Arc::from(std::fs::read_to_string(&custom.file).ok()?);
+        let (used, _, facts) = self.filter_at(position)?;
+        let custom = facts.filters.find(&used.name).filter(|_| !used.qualified)?;
+        let text: Arc<str> = Arc::from(project::read_text(&custom.file)?);
         location(&navigation::Location { path: custom.file.clone(), text, range: custom.range.clone() })
     }
 
@@ -1057,20 +1241,18 @@ impl Backend {
             let offset = structure.lines.offset(&structure.text, text_position(position.position));
             if let Some((name, description, range)) = scopes::loop_member_at(&structure.text, &structure.bindings, offset) {
                 let value = format!("**`loop.{name}`**\n\n{description}");
-                let range = Some(to_range(&structure.text, &structure.lines, range));
-                return Some(Hover { contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value }), range });
+                return Some(markdown_hover(value, Some(to_range(&structure.text, &structure.lines, range))));
             }
             let binding = scopes::binding_at(&structure.text, &structure.tags, &structure.bindings, offset)?;
-            let value = format!("**`{}`**: {}", binding.name, binding_summary(binding));
-            Some(Hover { contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value }), range: None })
+            Some(markdown_hover(format!("**`{}`**: {}", binding.name, binding_summary(binding)), None))
         })
         .flatten()
     }
 
     /// Where the name the template binds at a position is bound.
     fn binding_definition(&self, position: &TextDocumentPositionParams) -> Option<Location> {
-        let uri = position.text_document.uri.clone();
-        self.with_structure(&uri, |structure| {
+        let uri = &position.text_document.uri;
+        self.with_structure(uri, |structure| {
             let offset = structure.lines.offset(&structure.text, text_position(position.position));
             let binding = scopes::binding_at(&structure.text, &structure.tags, &structure.bindings, offset)?;
             Some(Location { uri: uri.clone(), range: to_range(&structure.text, &structure.lines, binding.range.clone()) })
@@ -1078,11 +1260,10 @@ impl Backend {
         .flatten()
     }
 
-    /// Every place the name the template binds at a position is written, the binding first,
-    /// with the document's URI and text.
+    /// Every place the name the template binds at a position is written, the binding first, with the document's URI and text.
     fn binding_occurrences(&self, position: &TextDocumentPositionParams) -> Option<(Uri, Arc<str>, Vec<ByteRange<usize>>)> {
-        let uri = position.text_document.uri.clone();
-        self.with_structure(&uri, |structure| {
+        let uri = &position.text_document.uri;
+        self.with_structure(uri, |structure| {
             let offset = structure.lines.offset(&structure.text, text_position(position.position));
             let binding = scopes::binding_at(&structure.text, &structure.tags, &structure.bindings, offset).filter(|binding| binding.kind != BindingKind::Loop)?;
             let ranges = scopes::occurrences(&structure.text, &structure.tags, &structure.bindings, binding);
@@ -1091,21 +1272,18 @@ impl Backend {
         .flatten()
     }
 
-    /// The struct members named by the variable at a position, each with its struct's name,
-    /// and the variable's range.
+    /// The struct members named by the variable at a position, each with its struct's name, and the variable's range.
     fn members_at(&self, position: &TextDocumentPositionParams) -> Option<(Vec<(String, Member)>, Range)> {
         let uri = &position.text_document.uri;
         let file = uri.to_file_path()?.into_owned();
-        let mut state = self.lock();
-        let text = state.template_text(uri)?;
-        let config = state.config_for(uri, &mut Vec::new());
-        let facts = state.crate_facts(uri);
+        let (text, config) = self.template(uri)?;
         let lines = LineIndex::new(&text);
         let offset = lines.offset(&text, text_position(position.position));
         let variable = navigation::variable_at(&text, &tags::scan(&text, &config.default_syntax()), offset)?;
-        let state = &*state;
-        let read = |path: &Path| state.read(path);
-        let found: Vec<(String, Member)> = Project::new(&config, &read)
+        let facts = self.facts(uri);
+        let cache = project::crate_root(&file).and_then(|root| self.file_cache(&root));
+        let read = |path: &Path| self.read_in(path, cache.as_deref());
+        let found: Vec<(String, Member)> = new_project(&config, &read, cache.as_deref())
             .structs_for(&file, &facts.structs)
             .into_iter()
             .filter_map(|template_struct| Some((template_struct.name.clone(), template_struct.member(&variable.name)?.clone())))
@@ -1117,33 +1295,34 @@ impl Backend {
     fn member_definition(&self, position: &TextDocumentPositionParams) -> Option<Location> {
         let (found, _) = self.members_at(position)?;
         let (_, member) = found.into_iter().next()?;
-        let text: Arc<str> = Arc::from(std::fs::read_to_string(&member.file).ok()?);
-        location(&navigation::Location { path: member.file, text, range: member.range })
+        let text: Arc<str> = Arc::from(project::read_text(&member.file)?);
+        location(&navigation::Location { path: member.file.to_path_buf(), text, range: member.range })
     }
 
     /// In a Rust file, the template named by the `#[template(path = "...")]` at a position.
     fn template_of_struct(&self, position: &TextDocumentPositionParams) -> Option<Location> {
         let uri = &position.text_document.uri;
         let file = uri.to_file_path()?.into_owned();
-        let mut state = self.lock();
-        if !state.documents.get(uri)?.rust {
-            return None;
-        }
-        let disk: Arc<str> = Arc::from(std::fs::read_to_string(&file).ok()?);
+        let config = {
+            let mut state = self.lock();
+            if !state.documents.get(uri)?.rust {
+                return None;
+            }
+            state.config_for(uri, &mut Vec::new())
+        };
+        let disk: Arc<str> = Arc::from(project::read_text(&file)?);
         let offset = LineIndex::new(&disk).offset(&disk, text_position(position.position));
-        let config = state.config_for(uri, &mut Vec::new());
-        let facts = state.crate_facts(uri);
+        let facts = self.facts(uri);
         let template_struct = facts
             .structs
             .iter()
             .find(|found| navigation::same_file(&found.file, &file) && found.template_range.start <= offset && offset <= found.template_range.end)?;
         let target = config.find_template(&template_struct.template, None)?;
-        let text = state.read(&target)?;
+        let text = self.read(&target)?;
         location(&navigation::Location { path: target, text, range: 0..0 })
     }
 
-    /// For the block named at a position: the block itself, and the blocks that override it
-    /// in templates extending this one.
+    /// For the block named at a position: the block itself, and the blocks that override it in templates extending this one.
     fn block_overrides(&self, position: &TextDocumentPositionParams) -> Option<(Option<Location>, Vec<Location>)> {
         self.with_project(&position.text_document.uri, |project, file, text| {
             let offset = LineIndex::new(text).offset(text, text_position(position.position));
@@ -1155,48 +1334,38 @@ impl Backend {
         .flatten()
     }
 
-    /// Parses the given open templates and publishes their diagnostics, along with those of
-    /// any `askama.toml` read along the way.
+    /// Parses the given open templates and publishes their diagnostics, along with those of any `askama.toml` read along the way.
     async fn check(&self, uris: Vec<Uri>) {
         let mut publications = Vec::new();
-        {
-            let mut state = self.lock();
-            for uri in uris {
+        for uri in uris {
+            let (text, version, config) = {
+                let mut state = self.lock();
                 let Some(document) = state.documents.get(&uri).filter(|document| !document.rust) else {
                     continue;
                 };
                 let (text, version) = (Arc::clone(&document.text), document.version);
-                let config = state.config_for(&uri, &mut publications);
-                let mut diagnostics = match template::parse(Arc::clone(&text), &config.default_syntax()) {
-                    Ok(_) => Vec::new(),
-                    Err(problem) => vec![error(&text, problem.range, problem.message)],
-                };
-                // While a tag is unclosed, the rest of the file reads as part of it, so names
-                // found there are not names: the syntax error is the only thing to report.
-                if diagnostics.is_empty() {
-                    let facts = state.crate_facts(&uri);
-                    diagnostics.extend(unknown_filters(&text, &config, &facts.filters));
-                    if let Some(file) = uri.to_file_path() {
-                        diagnostics.extend(unknown_variables(&state, &config, &facts, &file, &text));
-                    }
+                (text, version, state.config_for(&uri, &mut publications))
+            };
+            let mut diagnostics = self.diagnostics(&uri, &text, &config);
+            {
+                let mut state = self.lock();
+                // A newer edit has its own check, whose results these must not replace.
+                if state.documents.get(&uri).is_some_and(|document| document.version == version) {
+                    state.checked.insert(uri.clone(), (version, diagnostics.clone()));
                 }
-                if let Some(file) = uri.to_file_path() {
-                    diagnostics.extend(missing_templates(&state, &config, &file, &text));
-                }
-                state.checked.insert(uri.clone(), (version, diagnostics.clone()));
-                // The type check that follows replaces these; until then the last ones stand,
-                // so they do not blink off and on while typing.
+                // The type check that follows replaces these; until then the last ones stand, so they do not blink off and on while typing.
                 if diagnostics.iter().all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::ERROR)) {
                     diagnostics.extend(state.type_errors.get(&uri).cloned().unwrap_or_default());
                 } else {
                     state.type_errors.remove(&uri);
                 }
-                publications.push(Publication { uri, diagnostics, version: Some(version) });
             }
+            publications.push(Publication { uri, diagnostics, version: Some(version) });
         }
+        self.watch_template_dirs().await;
         for publication in publications {
-            // Checks run concurrently, one per change. One that finished after a newer edit
-            // would put its diagnostics where the text no longer matches, so it gives way.
+            // Checks run concurrently, one per change. One that finished after a newer edit would put its diagnostics where the text no
+            // longer matches, so it gives way.
             let outdated = publication.version.is_some_and(|version| {
                 self.lock().documents.get(&publication.uri).is_some_and(|document| document.version != version)
             });
@@ -1208,48 +1377,58 @@ impl Backend {
                 .await;
         }
     }
+
+    /// A template's own diagnostics: its syntax error, or else its unknown filters and variables, and its missing templates.
+    fn diagnostics(&self, uri: &Uri, text: &Arc<str>, config: &Config) -> Vec<Diagnostic> {
+        let mut diagnostics = match template::parse(Arc::clone(text), &config.default_syntax()) {
+            Ok(_) => Vec::new(),
+            Err(problem) => vec![error(text, problem.range, problem.message)],
+        };
+        let Some(file) = uri.to_file_path() else {
+            return diagnostics;
+        };
+        let cache = project::crate_root(&file).and_then(|root| self.file_cache(&root));
+        let read = |path: &Path| self.read_in(path, cache.as_deref());
+        let project = new_project(config, &read, cache.as_deref());
+        // While a tag is unclosed, the rest of the file reads as part of it, so names found there are not names: the syntax error is the
+        // only thing to report.
+        if diagnostics.is_empty() {
+            let facts = self.facts(uri);
+            diagnostics.extend(unknown_filters(text, config, &facts.filters));
+            diagnostics.extend(unknown_variables(&project, config, &facts, &file, text));
+        }
+        diagnostics.extend(missing_templates(&project, &file, text));
+        diagnostics
+    }
 }
 
 impl State {
-    /// What the Rust code of the crate a document belongs to says.
-    fn crate_facts(&mut self, uri: &Uri) -> CrateFacts {
-        match uri.to_file_path().and_then(|path| project::crate_root(&path)) {
-            Some(root) => self.rust.crate_facts(&root),
-            None => CrateFacts::default(),
-        }
-    }
-
     /// An open template's text. `None` for a Rust file or a document the server does not have.
     fn template_text(&self, uri: &Uri) -> Option<Arc<str>> {
         self.documents.get(uri).filter(|document| !document.rust).map(|document| Arc::clone(&document.text))
     }
 
-    /// A template's text: the editor's, if it is open, otherwise the file's.
-    fn read(&self, path: &Path) -> Option<Arc<str>> {
-        if let Some(document) = Uri::from_file_path(path).and_then(|uri| self.documents.get(&uri)) {
-            return Some(Arc::clone(&document.text));
-        }
-        std::fs::read_to_string(path).ok().map(Arc::from)
+    /// The editor's text of the file at `path`, if it is open.
+    fn open_text(&self, path: &Path) -> Option<Arc<str>> {
+        Uri::from_file_path(path).and_then(|uri| self.documents.get(&uri)).map(|document| Arc::clone(&document.text))
     }
 
-    /// The configuration of the crate a document belongs to, or Askama's defaults for a file
-    /// outside any crate.
+    /// The configuration of the crate a document belongs to, or Askama's defaults for a file outside any crate.
     fn config_for(&mut self, uri: &Uri, publications: &mut Vec<Publication>) -> Arc<Config> {
-        match uri.to_file_path().and_then(|path| project::crate_root(&path)) {
-            Some(root) => self.config(&root, publications),
-            None => Arc::new(Config::default_for(Path::new(""))),
-        }
+        uri.to_file_path()
+            .and_then(|path| project::crate_root(&path))
+            .map_or_else(|| Arc::new(Config::default_for(Path::new(""))), |root| self.config(&root, publications))
     }
 
-    /// The crate's configuration, read on first use. A broken `askama.toml` gets its own
-    /// diagnostic, and its templates are checked with Askama's defaults meanwhile.
+    /// The crate's configuration, read on first use. A broken `askama.toml` gets its own diagnostic, and its templates are checked with
+    /// Askama's defaults meanwhile.
     fn config(&mut self, root: &Path, publications: &mut Vec<Publication>) -> Arc<Config> {
         if let Some(config) = self.configs.get(root) {
             return Arc::clone(config);
         }
         let path = root.join(CONFIG_FILE_NAME);
-        let config = match std::fs::read_to_string(&path) {
-            Ok(source) => {
+        let config = match project::read_text(&path) {
+            Some(source) => {
                 let (config, diagnostics) = match Config::parse(root, &source) {
                     Ok(config) => (config, Vec::new()),
                     Err(problem) => (Config::default_for(root), vec![config_error(&source, problem)]),
@@ -1259,14 +1438,58 @@ impl State {
                 }
                 config
             }
-            Err(_) => Config::default_for(root),
+            None => Config::default_for(root),
         };
         let config = Arc::new(config);
         self.configs.insert(root.to_path_buf(), Arc::clone(&config));
+        self.unwatched_roots.push(root.to_path_buf());
         config
     }
 }
 
+/// Stops the crate's rust-analyzer once nothing has asked it anything for `ANALYZER_IDLE_LIMIT`, freeing its memory (gigabytes, for a large
+/// workspace). It is dropped from the server's state; the process ends when the last request still holding it finishes, since it is killed
+/// when dropped. Type checks never start one, so they pause until a member completion or hover starts it again.
+async fn stop_when_idle(backend: Backend, root: PathBuf, analyzer: std::sync::Weak<Analyzer>) {
+    loop {
+        tokio::time::sleep(ANALYZER_IDLE_CHECK).await;
+        let Some(running) = analyzer.upgrade() else {
+            return;
+        };
+        if running.idle_for() < ANALYZER_IDLE_LIMIT {
+            continue;
+        }
+        let stopped = {
+            let mut state = backend.lock();
+            let current = state.analyzers.get(&root).and_then(|cell| cell.get().cloned().flatten());
+            // Only this analyzer: a newer one for the same crate has its own task.
+            let is_this = current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &running));
+            if is_this {
+                state.analyzers.remove(&root);
+            }
+            is_this
+        };
+        drop(running);
+        if stopped {
+            let message = format!("Stopped the rust-analyzer for {} after {} idle minutes.", root.display(), ANALYZER_IDLE_LIMIT.as_secs() / 60);
+            backend.client.log_message(MessageType::INFO, message).await;
+        }
+        return;
+    }
+}
+
+/// Shows progress in the editor until rust-analyzer has loaded the crate at `root`.
+async fn show_loading(client: Client, root: PathBuf, analyzer: Arc<Analyzer>) {
+    let token = NumberOrString::String(format!("askama-rust-analyzer:{}", root.display()));
+    if client.create_work_done_progress(token.clone()).await.is_err() {
+        return;
+    }
+    let progress = client.progress(token, "Askama").with_message("rust-analyzer is loading the crate").begin().await;
+    let ready = analyzer.wait_ready(Duration::from_secs(600)).await;
+    progress.finish_with_message(if ready { "rust-analyzer is ready" } else { "rust-analyzer is still loading" }).await;
+}
+
+/// An error diagnostic on a range of a template.
 fn error(text: &str, range: ByteRange<usize>, message: String) -> Diagnostic {
     Diagnostic {
         range: to_range(text, &LineIndex::new(text), range),
@@ -1277,10 +1500,17 @@ fn error(text: &str, range: ByteRange<usize>, message: String) -> Diagnostic {
     }
 }
 
+/// A project for `config`'s crate, keeping what it learns of the files in `cache` when the crate has one (see `Backend::file_cache`).
+fn new_project<'a>(config: &'a Config, read: &'a Reader<'a>, cache: Option<&'a Mutex<FileCache>>) -> Project<'a> {
+    match cache {
+        Some(cache) => Project::with_cache(config, read, cache),
+        None => Project::new(config, read),
+    }
+}
+
 /// A warning on each template path Askama would not find.
-fn missing_templates(state: &State, config: &Config, file: &Path, text: &str) -> Vec<Diagnostic> {
-    let read = |path: &Path| state.read(path);
-    Project::new(config, &read)
+fn missing_templates(project: &Project<'_>, file: &Path, text: &str) -> Vec<Diagnostic> {
+    project
         .resolved_paths(file, text)
         .into_iter()
         .filter(|(_, target)| target.is_none())
@@ -1294,8 +1524,8 @@ fn missing_templates(state: &State, config: &Config, file: &Path, text: &str) ->
         .collect()
 }
 
-/// A warning on each filter that is neither built in nor in the crate's `filters` module,
-/// unless the module brings in names this reading cannot follow.
+/// A warning on each filter that is neither built in nor in the crate's `filters` module, unless the module brings in names this reading
+/// cannot follow.
 fn unknown_filters(text: &str, config: &Config, crate_filters: &CrateFilters) -> Vec<Diagnostic> {
     if crate_filters.incomplete {
         return Vec::new();
@@ -1311,12 +1541,9 @@ fn unknown_filters(text: &str, config: &Config, crate_filters: &CrateFilters) ->
         .collect()
 }
 
-/// A warning on each variable that is neither bound in the template nor a member of its
-/// structs. Only for a template whose structs are known and that is not included elsewhere,
-/// where it could also see the names bound around the `include`.
-fn unknown_variables(state: &State, config: &Config, facts: &CrateFacts, file: &Path, text: &str) -> Vec<Diagnostic> {
-    let read = |path: &Path| state.read(path);
-    let project = Project::new(config, &read);
+/// A warning on each variable that is neither bound in the template nor a member of its structs. Only for a template whose structs are
+/// known and that is not included elsewhere, where it could also see the names bound around the `include`.
+fn unknown_variables(project: &Project<'_>, config: &Config, facts: &CrateFacts, file: &Path, text: &str) -> Vec<Diagnostic> {
     let structs = project.structs_for(file, &facts.structs);
     if structs.is_empty() || !project.sees_only_struct_names(file, &structs) {
         return Vec::new();
@@ -1345,14 +1572,40 @@ fn binding_summary(binding: &Binding) -> String {
         BindingKind::Loop => format!("the state of the loop over `{}`: `index`, `index0`, `first`, `last`, `cycle(…)`", binding.origin),
         BindingKind::Let => format!("set by `let` to `{}`", binding.origin),
         BindingKind::MacroArgument => format!("argument of macro `{}`", binding.origin),
-        BindingKind::MatchArm => format!("bound by `{}`", binding.origin),
-        BindingKind::IfLet => format!("bound by `{}`", binding.origin),
+        BindingKind::CallerArgument => format!("passed by macro `{}` through `caller(…)`", binding.origin),
+        BindingKind::MatchArm | BindingKind::IfLet => format!("bound by `{}`", binding.origin),
     }
 }
 
-/// A completion item from rust-analyzer's answer about a probe, made to fit the template: only
-/// fields and methods, without ones that would need an import, a method inserted with its
-/// parentheses, and the replaced range the template's.
+/// The members of `loop`, inside a `for` loop.
+fn loop_items(range: Range) -> Vec<CompletionItem> {
+    LOOP_MEMBERS
+        .iter()
+        .map(|&(name, description)| CompletionItem {
+            documentation: Some(markdown(description.to_owned())),
+            ..item(name, if name == "cycle" { CompletionItemKind::METHOD } else { CompletionItemKind::PROPERTY }, range)
+        })
+        .collect()
+}
+
+/// The tag keywords, the one that closes the innermost open region (`closer`) first and preselected.
+fn keyword_items(closer: Option<&str>, range: Range) -> Vec<CompletionItem> {
+    KEYWORDS
+        .iter()
+        .map(|&keyword| {
+            let first = closer == Some(keyword);
+            CompletionItem {
+                sort_text: Some(format!("{}{keyword}", u8::from(!first))),
+                preselect: first.then_some(true),
+                detail: first.then(|| "closes the innermost open tag".to_owned()),
+                ..item(keyword, CompletionItemKind::KEYWORD, range)
+            }
+        })
+        .collect()
+}
+
+/// A completion item from rust-analyzer's answer about a probe, made to fit the template: only fields and methods, without ones that would
+/// need an import, a method inserted with its parentheses, and the replaced range the template's.
 fn analyzer_item(found: &serde_json::Value, range: Range) -> Option<CompletionItem> {
     let kind = match found["kind"].as_u64()? {
         2 => CompletionItemKind::METHOD,
@@ -1362,8 +1615,7 @@ fn analyzer_item(found: &serde_json::Value, range: Range) -> Option<CompletionIt
     if found["additionalTextEdits"].as_array().is_some_and(|edits| !edits.is_empty()) {
         return None;
     }
-    // The label, not `filterText`, which can carry doc aliases run together
-    // (`count_onespopcountpopcnt`).
+    // The label, not `filterText`, which can carry doc aliases run together (`count_onespopcountpopcnt`).
     let label = found["label"].as_str()?;
     let name = label.split('(').next().unwrap_or(label).trim();
     let new_text = if kind == CompletionItemKind::METHOD { format!("{name}()") } else { name.to_owned() };
@@ -1384,6 +1636,7 @@ fn analyzer_item(found: &serde_json::Value, range: Range) -> Option<CompletionIt
     })
 }
 
+/// A completion item that inserts its label over `range`.
 fn item(label: &str, kind: CompletionItemKind, range: Range) -> CompletionItem {
     CompletionItem {
         label: label.to_owned(),
@@ -1404,18 +1657,27 @@ fn member_docs(member: &Member, owners: &[&str]) -> String {
     if member.docs.is_empty() { owned } else { format!("{}\n\n{owned}", member.docs) }
 }
 
-fn markdown(value: String) -> Documentation {
+/// Markdown documentation for a completion item.
+const fn markdown(value: String) -> Documentation {
     Documentation::MarkupContent(MarkupContent { kind: MarkupKind::Markdown, value })
 }
 
+/// A hover showing Markdown.
+const fn markdown_hover(value: String, range: Option<Range>) -> Hover {
+    Hover { contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value }), range }
+}
+
+/// The diagnostic for a broken `askama.toml`.
 fn config_error(source: &str, problem: ConfigError) -> Diagnostic {
     error(source, problem.range.unwrap_or(0..0), problem.message)
 }
 
+/// The LSP range of a byte range of `text`.
 fn to_range(text: &str, lines: &LineIndex, range: ByteRange<usize>) -> Range {
     Range { start: position(lines.position(text, range.start)), end: position(lines.position(text, range.end)) }
 }
 
+/// The document symbol of a region, with its children.
 fn symbol(text: &str, lines: &LineIndex, region: &Region) -> DocumentSymbol {
     let kind = match region.kind {
         RegionKind::Block => SymbolKind::NAMESPACE,
@@ -1449,7 +1711,8 @@ fn position_of(value: &serde_json::Value) -> Option<TextPosition> {
     Some(TextPosition { line: u32::try_from(value["line"].as_u64()?).ok()?, character: u32::try_from(value["character"].as_u64()?).ok()? })
 }
 
-fn text_position(position: Position) -> TextPosition {
+/// An LSP position as the analysis's position.
+const fn text_position(position: Position) -> TextPosition {
     TextPosition { line: position.line, character: position.character }
 }
 
@@ -1465,7 +1728,8 @@ fn is_subsequence(query: &str, name: &str) -> bool {
     query.chars().all(|wanted| name.any(|found| found == wanted))
 }
 
-fn position(position: TextPosition) -> Position {
+/// The analysis's position as an LSP position.
+const fn position(position: TextPosition) -> Position {
     Position { line: position.line, character: position.character }
 }
 
@@ -1473,8 +1737,16 @@ fn position(position: TextPosition) -> Position {
 async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
-        can_watch_files: AtomicBool::new(false),
-        state: Mutex::new(State::default()),
+        can_watch_files: Arc::new(AtomicBool::new(false)),
+        can_watch_relative: Arc::new(AtomicBool::new(false)),
+        state: Arc::new(Mutex::new(State::default())),
+        rust: Arc::new(Mutex::new(RustIndex::default())),
     });
-    Server::new(tokio::io::stdin(), tokio::io::stdout(), socket).serve(service).await;
+    // A panic is logged in the client's output. The report is a plain function, so it hands the sending to a task of its own.
+    let client = service.inner().client.clone();
+    let report: panics::Report = Arc::new(move |message| {
+        let client = client.clone();
+        tokio::spawn(async move { client.log_message(MessageType::ERROR, message).await });
+    });
+    Server::new(tokio::io::stdin(), tokio::io::stdout(), socket).serve(CatchPanics::new(service, report)).await;
 }
