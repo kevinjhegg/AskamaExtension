@@ -125,16 +125,47 @@ jobs:
         working-directory: editors/vscode
         run: npm ci --no-audit --no-fund
 
+      # --skip-duplicate lets a rerun of this job publish only what is missing.
       - name: Publish to the Visual Studio Marketplace
         working-directory: editors/vscode
-        run: npx vsce publish --packagePath ../../dist/*.vsix
+        run: npx vsce publish --skip-duplicate --packagePath ../../dist/*.vsix
+
+      # The Marketplace can accept a platform's package and then drop it, as it did for four of the five on the first release, while it
+      # verifies a new extension. This waits for every platform to download and publishes again any that do not, three times at most.
+      - name: Check that every platform downloads from the Marketplace
+        working-directory: editors/vscode
+        run: |
+          gallery="https://marketplace.visualstudio.com/_apis/public/gallery/publishers/kevinhegg/vsextensions/askama-vscode/$VERSION/vspackage"
+          missing() {
+            for vsix in ../../dist/*.vsix; do
+              target=$(basename "$vsix" "-$VERSION.vsix")
+              target=${target#askama-vscode-}
+              code=$(curl -s -o /dev/null -w '%{http_code}' "$gallery?targetPlatform=$target")
+              [ "$code" = 200 ] || echo "$vsix"
+            done
+          }
+          for round in 1 2 3; do
+            # Up to 10 minutes for the Marketplace to serve what was published.
+            for check in $(seq 20); do
+              left=$(missing)
+              [ -z "$left" ] && { echo "Every platform downloads."; exit 0; }
+              sleep 30
+            done
+            echo "Not served after round $round, publishing again:"
+            echo "$left"
+            npx vsce publish --skip-duplicate --packagePath $left
+          done
+          left=$(missing)
+          [ -z "$left" ] && { echo "Every platform downloads."; exit 0; }
+          echo "::error::The Marketplace does not serve: $(echo $left | xargs -n1 basename | tr '\n' ' ')"
+          exit 1
 
       - name: Publish to Open VSX
         if: env.OVSX_PAT != ''
         working-directory: editors/vscode
         run: |
           for vsix in ../../dist/*.vsix; do
-            npx ovsx publish "$vsix" -p "$OVSX_PAT"
+            npx ovsx publish "$vsix" -p "$OVSX_PAT" --skip-duplicate
           done
 
       - name: Create the GitHub release
@@ -143,4 +174,9 @@ jobs:
         run: |
           # The changelog's section for this version, without its heading.
           awk -v heading="## $VERSION " 'index($0, heading) == 1 { found = 1; next } found && /^## / { exit } found' editors/vscode/CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" dist/*.vsix --title "$GITHUB_REF_NAME" --notes-file notes.md
+          # On a rerun the release exists already, so its files are replaced instead.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.vsix --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.vsix --title "$GITHUB_REF_NAME" --notes-file notes.md
+          fi
